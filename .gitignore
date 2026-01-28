@@ -35,9 +35,15 @@ yarn-error.log
 .idea/
 
 # Pictures
-preview.png
+*.png
 *.jpg
 *.jpeg
 *.gif
 *.webp
 
+# Ignore all .md files by default
+*.md
+
+# Exception: Do not ignore README.md
+!README.md
+!blackhole.png
