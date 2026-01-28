@@ -212,13 +212,16 @@ public:
   enum class Mode { Orbit, Free };
   Mode activeMode = Mode::Orbit;
 
-  float distance = 15.0f, theta = 0.0f, phi = 1.48f;
+  // phi = Pitch (up/down), theta = Yaw (around), roll = Bank (tilt)
+  float distance = 15.0f, theta = 0.0f, phi = 1.48f, roll = 0.0f;
   simd_float3 freePos = {0.0f, 0.0f, 20.0f};
   float yaw = -M_PI / 2.0f, pitch = 0.0f, speed = 0.5f;
 
   bool keyW = false, keyA = false, keyS = false, keyD = false;
   bool keyQ = false, keyE = false, keyShift = false;
   bool keyZ = false, keyX = false;
+  bool keyK = false, keyL = false;
+  bool keyLeft = false, keyRight = false;
   bool isDragging = false;
   float lastMouseX = 0.0f, lastMouseY = 0.0f;
 
@@ -257,6 +260,21 @@ public:
       if (keyX)
         distance = fmin(5000.0f, distance + zoomSpeed);
     }
+
+    // Roll Control (Available in both modes)
+    float rollSpeed = 1.5f * dt;
+    if (keyK)
+      roll -= rollSpeed;
+    if (keyL)
+      roll += rollSpeed;
+
+    // Orbit Control (Arrow Keys) matching mouse drag
+    // Mouse drag uses theta += dx * 0.01f
+    float orbitSpeed = 1.5f * dt;
+    if (keyLeft)
+      theta += orbitSpeed; // Similar to dragging right
+    if (keyRight)
+      theta -= orbitSpeed; // Similar to dragging left
   }
 
   void getVectors(simd_float3 &outPos, simd_float3 &outFwd,
@@ -267,8 +285,18 @@ public:
                  : simd_make_float3(cos(pitch) * cos(yaw), sin(pitch),
                                     cos(pitch) * sin(yaw));
     simd_float3 worldUp = {0.0f, 1.0f, 0.0f};
-    outRight = simd_normalize(simd_cross(outFwd, worldUp));
-    outUp = simd_cross(outRight, outFwd);
+
+    // Base basis vectors
+    simd_float3 baseRight = simd_normalize(simd_cross(outFwd, worldUp));
+    simd_float3 baseUp = simd_cross(baseRight, outFwd);
+
+    // Apply Roll Rotation
+    // Rotate baseRight and baseUp around outFwd by 'roll' angle
+    float c = cos(roll);
+    float s = sin(roll);
+
+    outRight = baseRight * c + baseUp * s;
+    outUp = -baseRight * s + baseUp * c;
   }
 
   void onMouseDrag(float dx, float dy) {
@@ -847,6 +875,18 @@ static float g_currentFPS = 0.0f;
   case NSDownArrowFunctionKey:
     g_camera.keyX = true;
     break;
+  case NSLeftArrowFunctionKey:
+    g_camera.keyLeft = true;
+    break;
+  case NSRightArrowFunctionKey:
+    g_camera.keyRight = true;
+    break;
+  case 'k':
+    g_camera.keyK = true;
+    break;
+  case 'l':
+    g_camera.keyL = true;
+    break;
   case 'c':
     g_camera.toggleMode();
     break;
@@ -907,6 +947,18 @@ static float g_currentFPS = 0.0f;
   case 'x':
   case NSDownArrowFunctionKey:
     g_camera.keyX = false;
+    break;
+  case NSLeftArrowFunctionKey:
+    g_camera.keyLeft = false;
+    break;
+  case NSRightArrowFunctionKey:
+    g_camera.keyRight = false;
+    break;
+  case 'k':
+    g_camera.keyK = false;
+    break;
+  case 'l':
+    g_camera.keyL = false;
     break;
   }
 }
