@@ -1,0 +1,43 @@
+# OS generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+*.o
+*.obj
+*.dSYM/
+
+# Executables
+blackhole-sim-metal
+*.exe
+*.out
+*.app
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# Javascript/Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Pictures
+preview.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+

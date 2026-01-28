@@ -1,0 +1,881 @@
+// Black Hole Ray Tracer - Metal 4K Optimized
+// Pure Objective-C++ implementation (no metal-cpp dependency)
+
+#import <Cocoa/Cocoa.h>
+#import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#import <simd/simd.h>
+
+// ============================================================================
+// Constants and Star Data (from ours.html)
+// ============================================================================
+
+constexpr float TAU = M_PI * 2.0f;
+
+struct StarData {
+  const char *name;
+  float a_AU, e, i_deg, Omega_deg, omega_deg, Tp_year, P_year;
+  simd_float3 color;
+};
+
+const StarData STAR_S2 = {"S2",      0.1251f * 8178.0f, 0.8843f,
+                          133.91f,   228.07f,           66.25f,
+                          2018.379f, 16.0518f,          {0.70f, 0.85f, 1.00f}};
+const StarData STAR_S55 = {"S55",
+                           0.10424f * 8275.9f,
+                           0.72980f,
+                           159.59f,
+                           319.43f,
+                           327.77f,
+                           2009.4738f,
+                           12.22f,
+                           {0.95f, 0.60f, 0.20f}};
+const StarData STAR_S38 = {"S38",
+                           0.14249f * 8275.9f,
+                           0.81807f,
+                           168.69f,
+                           122.43f,
+                           40.065f,
+                           2022.6843f,
+                           19.53f,
+                           {0.75f, 0.30f, 0.95f}};
+const StarData STAR_S29 = {"S29",
+                           0.39025f * 8275.9f,
+                           0.96880f,
+                           144.24f,
+                           4.9259f,
+                           203.68f,
+                           2021.4102f,
+                           88.52f,
+                           {0.20f, 0.95f, 0.30f}};
+const StarData STAR_S4716 = {"S4716", 411.0f, 0.756f,
+                             70.0f,   10.0f,  300.0f,
+                             2022.5f, 4.02f,  {1.0f, 0.2f, 0.6f}};
+
+// ============================================================================
+// Uniform Structure
+// ============================================================================
+
+struct Uniforms {
+  simd_float3 camPos;
+  float time;
+  simd_float3 camFwd;
+  float rs;
+  simd_float3 camRight;
+  float rin;
+  simd_float3 camUp;
+  float rout;
+
+  float tanHalfFov;
+  float aspect;
+  float dPhi;
+  float escapeR;
+
+  float diskBoost;
+  int32_t maxSteps;
+  float debugView;
+  float qualityLevel;
+
+  simd_float3 starPos;
+  float starSize;
+  simd_float3 starColor;
+  float starBoost;
+
+  simd_float3 star2Pos;
+  float star2Size;
+  simd_float3 star2Color;
+  float star2Boost;
+
+  simd_float3 star3Pos;
+  float star3Size;
+  simd_float3 star3Color;
+  float star3Boost;
+
+  simd_float3 star4Pos;
+  float star4Size;
+  simd_float3 star4Color;
+  float star4Boost;
+
+  simd_float3 star5Pos;
+  float star5Size;
+  simd_float3 star5Color;
+  float star5Boost;
+
+  uint32_t width;
+  uint32_t height;
+  uint32_t _pad0, _pad1;
+};
+
+// ============================================================================
+// Quality Presets
+// ============================================================================
+
+enum class QualityPreset { Low, Medium, High, Ultra };
+
+struct SimParams {
+  float rs = 1.0f;
+  float rin = 1.90f;
+  float rout = 12.0f;
+  int maxSteps = 200;
+  float dPhi = 0.05f;
+  float escapeR = 5000.0f;
+  float diskBoost = 9.0f;
+  float debugView = 0.0f;
+  float starSize = 1.0f;
+  float starBoost = 6.0f;
+  QualityPreset quality = QualityPreset::High;
+
+  void setQuality(QualityPreset q) {
+    quality = q;
+    switch (q) {
+    case QualityPreset::Low:
+      maxSteps = 100;
+      dPhi = 0.08f;
+      escapeR = 2000.0f;
+      break;
+    case QualityPreset::Medium:
+      maxSteps = 150;
+      dPhi = 0.06f;
+      escapeR = 3000.0f;
+      break;
+    case QualityPreset::High:
+      maxSteps = 200;
+      dPhi = 0.05f;
+      escapeR = 5000.0f;
+      break;
+    case QualityPreset::Ultra:
+      maxSteps = 300;
+      dPhi = 0.04f;
+      escapeR = 10000.0f;
+      break;
+    }
+  }
+};
+
+// ============================================================================
+// Kepler Orbit Mathematics
+// ============================================================================
+
+float wrapTau(float x) {
+  x = fmod(x, TAU);
+  return x < 0 ? x + TAU : x;
+}
+
+float solveKepler(float M, float e) {
+  float E = e < 0.8f ? M : M_PI;
+  for (int k = 0; k < 8; k++) {
+    float f = E - e * sin(E) - M;
+    E -= f / (1.0f - e * cos(E));
+  }
+  return E;
+}
+
+simd_float3 orbitalPosition3D(const StarData &star, float year) {
+  float n = TAU / star.P_year;
+  float M = wrapTau(n * (year - star.Tp_year));
+  float E = solveKepler(M, star.e);
+  float r = star.a_AU * (1.0f - star.e * cos(E));
+  float nu = 2.0f * atan2(sqrt(1.0f + star.e) * sin(E / 2.0f),
+                          sqrt(1.0f - star.e) * cos(E / 2.0f));
+
+  float xP = r * cos(nu), yP = r * sin(nu);
+  float Omega = star.Omega_deg * M_PI / 180.0f;
+  float i = star.i_deg * M_PI / 180.0f;
+  float omega = star.omega_deg * M_PI / 180.0f;
+
+  float x1 = xP * cos(omega) - yP * sin(omega);
+  float y1 = xP * sin(omega) + yP * cos(omega);
+  float x2 = x1, y2 = y1 * cos(i), z2 = y1 * sin(i);
+
+  return simd_make_float3(x2 * cos(Omega) - y2 * sin(Omega),
+                          x2 * sin(Omega) + y2 * cos(Omega), z2);
+}
+
+// ============================================================================
+// Camera System
+// ============================================================================
+
+class Camera {
+public:
+  enum class Mode { Orbit, Free };
+  Mode activeMode = Mode::Orbit;
+
+  float distance = 15.0f, theta = 0.0f, phi = 1.48f;
+  simd_float3 freePos = {0.0f, 0.0f, 20.0f};
+  float yaw = -M_PI / 2.0f, pitch = 0.0f, speed = 0.5f;
+
+  bool keyW = false, keyA = false, keyS = false, keyD = false;
+  bool keyQ = false, keyE = false, keyShift = false;
+  bool keyZ = false, keyX = false;
+  bool isDragging = false;
+  float lastMouseX = 0.0f, lastMouseY = 0.0f;
+
+  simd_float3 getPosition() const {
+    if (activeMode == Mode::Orbit) {
+      return simd_make_float3(distance * sin(phi) * cos(theta),
+                              distance * cos(phi),
+                              distance * sin(phi) * sin(theta));
+    }
+    return freePos;
+  }
+
+  void update(float dt) {
+    if (activeMode == Mode::Free) {
+      float moveSpeed = speed * (keyShift ? 3.0f : 1.0f) * dt * 60.0f;
+      simd_float3 fwd = {cos(yaw), 0.0f, sin(yaw)};
+      simd_float3 right = {-sin(yaw), 0.0f, cos(yaw)};
+
+      if (keyW)
+        freePos += fwd * moveSpeed;
+      if (keyS)
+        freePos -= fwd * moveSpeed;
+      if (keyD)
+        freePos += right * moveSpeed;
+      if (keyA)
+        freePos -= right * moveSpeed;
+      if (keyE)
+        freePos.y += moveSpeed;
+      if (keyQ)
+        freePos.y -= moveSpeed;
+    } else {
+      // Orbit interaction
+      float zoomSpeed = distance * 0.3f * dt;
+      if (keyZ)
+        distance = fmax(2.0f, distance - zoomSpeed);
+      if (keyX)
+        distance = fmin(5000.0f, distance + zoomSpeed);
+    }
+  }
+
+  void getVectors(simd_float3 &outPos, simd_float3 &outFwd,
+                  simd_float3 &outRight, simd_float3 &outUp) const {
+    outPos = getPosition();
+    outFwd = (activeMode == Mode::Orbit)
+                 ? simd_normalize(-outPos)
+                 : simd_make_float3(cos(pitch) * cos(yaw), sin(pitch),
+                                    cos(pitch) * sin(yaw));
+    simd_float3 worldUp = {0.0f, 1.0f, 0.0f};
+    outRight = simd_normalize(simd_cross(outFwd, worldUp));
+    outUp = simd_cross(outRight, outFwd);
+  }
+
+  void onMouseDrag(float dx, float dy) {
+    if (activeMode == Mode::Orbit) {
+      theta += dx * 0.01f;
+      phi = fmax(0.1f, fmin(M_PI - 0.1f, phi + dy * 0.01f));
+    } else {
+      yaw += dx * 0.003f;
+      pitch = fmax(-1.47f, fmin(1.47f, pitch - dy * 0.003f));
+    }
+  }
+
+  void onScroll(float delta) {
+    if (activeMode == Mode::Orbit)
+      distance = fmax(2.0f, fmin(5000.0f, distance * (1.0f - delta * 0.1f)));
+  }
+
+  void toggleMode() {
+    if (activeMode == Mode::Orbit) {
+      activeMode = Mode::Free;
+      freePos = getPosition();
+      yaw = atan2(-freePos.z, -freePos.x);
+      pitch = asin(-freePos.y / simd_length(freePos));
+    } else {
+      activeMode = Mode::Orbit;
+    }
+  }
+};
+
+// ============================================================================
+// Metal Shader Source
+// ============================================================================
+
+NSString *computeShaderSource = @R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Uniforms {
+    float3 camPos; float time;
+    float3 camFwd; float rs;
+    float3 camRight; float rin;
+    float3 camUp; float rout;
+    float tanHalfFov; float aspect; float dPhi; float escapeR;
+    float diskBoost; int maxSteps; float debugView; float qualityLevel;
+    float3 starPos; float starSize; float3 starColor; float starBoost;
+    float3 star2Pos; float star2Size; float3 star2Color; float star2Boost;
+    float3 star3Pos; float star3Size; float3 star3Color; float star3Boost;
+    float3 star4Pos; float star4Size; float3 star4Color; float star4Boost;
+    float3 star5Pos; float star5Size; float3 star5Color; float star5Boost;
+    uint width; uint height; uint _pad0; uint _pad1;
+};
+
+inline float hash3(float3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+inline float noise3D(float3 p) {
+    float3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash3(i), hash3(i + float3(1,0,0)), f.x),
+                   mix(hash3(i + float3(0,1,0)), hash3(i + float3(1,1,0)), f.x), f.y),
+               mix(mix(hash3(i + float3(0,0,1)), hash3(i + float3(1,0,1)), f.x),
+                   mix(hash3(i + float3(0,1,1)), hash3(i + float3(1,1,1)), f.x), f.y), f.z);
+}
+
+inline float fbmDisk(float2 p, float lod) {
+    float3 pos3D = float3(p.x, cos(p.y / 2.0) * 2.0, sin(p.y / 2.0) * 2.0);
+    float f = 0.5 * noise3D(pos3D);
+    
+    // Detail octave: smooth fade out between LOD 1.0 and 2.5
+    float detailVis = 1.0 - smoothstep(1.0, 2.5, lod);
+    f += 0.25 * noise3D(pos3D * 2.02) * detailVis;
+    
+    // Base octave: smooth fade to grey between LOD 2.5 and 5.0
+    float baseVis = 1.0 - smoothstep(2.5, 5.0, lod);
+    return mix(0.5, f, baseVis);
+}
+
+kernel void blackHoleCompute(
+    texture2d<float, access::write> output [[texture(0)]],
+    constant Uniforms& u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    
+    float2 uv = float2(gid) / float2(u.width, u.height);
+    float2 ndc = uv * 2.0 - 1.0;
+    
+    int dbg = int(u.debugView + 0.5);
+    if (dbg == 1) { output.write(float4(uv, 0.0, 1.0), gid); return; }
+    
+    float3 rd = normalize(u.camFwd + u.camRight * (ndc.x * u.tanHalfFov * u.aspect) +
+                          u.camUp * (ndc.y * u.tanHalfFov));
+    float3 ro = u.camPos;
+    
+    if (dbg == 2) { output.write(float4(rd * 0.5 + 0.5, 1.0), gid); return; }
+    
+    float3 L = cross(ro, rd);
+    float b = length(L);
+    float3 Lhat = (b < 1e-5) ? normalize(cross(ro, float3(0.0, 1.0, 0.0))) : normalize(L);
+    
+    float3 e1 = normalize(ro - Lhat * dot(ro, Lhat));
+    float3 e2 = cross(Lhat, e1);
+    
+    float r0 = length(ro);
+    float u_orbit = 1.0 / max(r0, 1e-6);
+    float3 dproj = normalize(rd - Lhat * dot(rd, Lhat));
+    float w = -u_orbit * dot(dproj, e1) / max(dot(dproj, e2), 1e-4);
+    float phi = 0.0;
+    
+    float3 pPrev = ro, p = ro;
+    int hitType = 0;
+    bool didHitDisk = false;
+    float trans = 1.0;
+    float3 accum = float3(0.0);
+    
+    for (int it = 0; it < u.maxSteps; it++) {
+        float r = 1.0 / max(u_orbit, 1e-6);
+        float h = u.dPhi * (r > 10.0 ? 2.0 : (r > 5.0 ? 1.5 : (r < 2.0 ? 0.7 : 1.0)));
+        
+        float k1w = 1.5 * u.rs * u_orbit * u_orbit - u_orbit;
+        float u2 = u_orbit + 0.5 * h * w;
+        float k2w = 1.5 * u.rs * u2 * u2 - u2;
+        float u3 = u_orbit + 0.5 * h * (w + 0.5 * h * k1w);
+        float k3w = 1.5 * u.rs * u3 * u3 - u3;
+        float u4 = u_orbit + h * (w + 0.5 * h * k2w);
+        float k4w = 1.5 * u.rs * u4 * u4 - u4;
+        
+        u_orbit += h * w + (h * h / 6.0) * (k1w + k2w + k3w);
+        w += (h / 6.0) * (k1w + 2.0 * k2w + 2.0 * k3w + k4w);
+        phi += h;
+        
+        r = 1.0 / max(u_orbit, 1e-6);
+        pPrev = p;
+        p = (e1 * cos(phi) + e2 * sin(phi)) * r;
+        
+        if (r < u.rs * 1.001) { hitType = 1; break; }
+        if (r > u.escapeR) { hitType = 3; break; }
+        
+        if (pPrev.y * p.y < 0.0 && !didHitDisk) {
+            float t = pPrev.y / (pPrev.y - p.y);
+            float3 phit = mix(pPrev, p, t);
+            float rr = length(float2(phit.x, phit.z));
+            
+            if (rr > u.rin && rr < u.rout) {
+                float ang = atan2(phit.z, phit.x) + u.time * 6.0 / sqrt(rr) * 0.2;
+                float dist = length(phit - u.camPos);
+                // Increased LOD factor from 40.0 to 100.0 to reduce Moire
+                float texLOD = (u.tanHalfFov * dist * 2.0) / 800.0 * 100.0;
+                
+                float n = fbmDisk(float2(rr * 12.0, ang * 2.0), texLOD);
+                float filaments = smoothstep(0.2, 0.8, n);
+                float alpha = smoothstep(u.rin, u.rin + 1.0, rr) * 
+                              (1.0 - smoothstep(u.rout - 4.0, u.rout, rr));
+                
+                float temp = pow(u.rin / rr, 1.5);
+                float3 blackbody = mix(float3(0.8, 0.1, 0.01), float3(1.0, 0.9, 0.8), saturate(temp));
+                
+                float3 vdir = normalize(float3(-phit.z, 0.0, phit.x));
+                float vmag = min(sqrt(u.rs / (2.0 * rr)), 0.7);
+                float doppler = 1.0 / (1.0 - vmag * dot(vdir, -normalize(p - pPrev)));
+                
+                float3 diskCol = blackbody * filaments * doppler * doppler * doppler * u.diskBoost;
+                float diskOpacity = saturate(alpha * 0.65);
+                
+                accum += diskCol * diskOpacity * trans;
+                trans *= (1.0 - diskOpacity);
+                didHitDisk = true;
+                hitType = 2;
+                if (trans < 0.02) break;
+            }
+        }
+    }
+    
+    if (dbg == 3) {
+        float4 col = (hitType == 2) ? float4(1,1,0,1) : (hitType == 1) ? float4(1,0,0,1) :
+                     (hitType == 3) ? float4(0.1,0.3,1,1) : float4(0,0.6,0.2,1);
+        output.write(col, gid);
+        return;
+    }
+    
+    output.write(float4(accum, 1.0), gid);
+}
+)";
+
+NSString *displayShaderSource = @R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut { float4 position [[position]]; float2 uv; };
+constant float2 pos[] = { float2(-1,-1), float2(3,-1), float2(-1,3) };
+
+vertex VertexOut vertexMain(uint vid [[vertex_id]]) {
+    VertexOut out;
+    out.position = float4(pos[vid], 0.0, 1.0);
+    out.uv = pos[vid] * 0.5 + 0.5;
+    return out;
+}
+
+fragment float4 fragmentMain(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
+    constexpr sampler s(filter::linear);
+    return tex.sample(s, in.uv);
+}
+)";
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+static Camera g_camera;
+static SimParams g_params;
+static float g_simYear = 2024.0f;
+static std::chrono::high_resolution_clock::time_point g_startTime;
+static std::chrono::high_resolution_clock::time_point g_lastFrameTime;
+static int g_frameCount = 0;
+static float g_lastFPSTime = 0.0f;
+static float g_currentFPS = 0.0f;
+
+// ============================================================================
+// Metal View
+// ============================================================================
+
+@interface BlackHoleView : MTKView
+@property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property(nonatomic, strong) id<MTLComputePipelineState> computePipeline;
+@property(nonatomic, strong) id<MTLRenderPipelineState> displayPipeline;
+@property(nonatomic, strong) id<MTLBuffer> uniformBuffer;
+@property(nonatomic, strong) id<MTLTexture> renderTexture;
+@property(nonatomic) uint32_t texWidth;
+@property(nonatomic) uint32_t texHeight;
+@end
+
+@implementation BlackHoleView
+
+- (instancetype)initWithFrame:(NSRect)frame device:(id<MTLDevice>)device {
+  self = [super initWithFrame:frame device:device];
+  if (self) {
+    self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    self.clearColor = MTLClearColorMake(0, 0, 0, 1);
+
+    _commandQueue = [device newCommandQueue];
+
+    NSError *error = nil;
+    id<MTLLibrary> computeLib = [device newLibraryWithSource:computeShaderSource
+                                                     options:nil
+                                                       error:&error];
+    if (!computeLib) {
+      NSLog(@"Compute shader error: %@", error);
+      return nil;
+    }
+    _computePipeline =
+        [device newComputePipelineStateWithFunction:
+                    [computeLib newFunctionWithName:@"blackHoleCompute"]
+                                              error:&error];
+
+    id<MTLLibrary> displayLib = [device newLibraryWithSource:displayShaderSource
+                                                     options:nil
+                                                       error:&error];
+    if (!displayLib) {
+      NSLog(@"Display shader error: %@", error);
+      return nil;
+    }
+
+    MTLRenderPipelineDescriptor *pipeDesc =
+        [[MTLRenderPipelineDescriptor alloc] init];
+    pipeDesc.vertexFunction = [displayLib newFunctionWithName:@"vertexMain"];
+    pipeDesc.fragmentFunction =
+        [displayLib newFunctionWithName:@"fragmentMain"];
+    pipeDesc.colorAttachments[0].pixelFormat = self.colorPixelFormat;
+    _displayPipeline = [device newRenderPipelineStateWithDescriptor:pipeDesc
+                                                              error:&error];
+
+    _uniformBuffer = [device newBufferWithLength:sizeof(Uniforms)
+                                         options:MTLResourceStorageModeShared];
+
+    g_startTime = std::chrono::high_resolution_clock::now();
+    g_lastFrameTime = g_startTime;
+  }
+  return self;
+}
+
+- (void)createTextureWithWidth:(uint32_t)width height:(uint32_t)height {
+  if (_renderTexture && _texWidth == width && _texHeight == height)
+    return;
+
+  MTLTextureDescriptor *desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                   width:width
+                                  height:height
+                               mipmapped:NO];
+  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  desc.storageMode = MTLStorageModePrivate;
+  _renderTexture = [self.device newTextureWithDescriptor:desc];
+  _texWidth = width;
+  _texHeight = height;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  auto now = std::chrono::high_resolution_clock::now();
+  float dt = std::chrono::duration<float>(now - g_lastFrameTime).count();
+  g_lastFrameTime = now;
+  float time = std::chrono::duration<float>(now - g_startTime).count();
+
+  g_camera.update(dt);
+
+  CGSize size = self.drawableSize;
+  [self createTextureWithWidth:(uint32_t)size.width
+                        height:(uint32_t)size.height];
+
+  simd_float3 camPos, camFwd, camRight, camUp;
+  g_camera.getVectors(camPos, camFwd, camRight, camUp);
+
+  const float ORBIT_SCALE = 40.0f;
+  auto calcStarPos = [ORBIT_SCALE](const StarData &star) -> simd_float3 {
+    simd_float3 p = orbitalPosition3D(star, g_simYear);
+    return p / star.a_AU * ORBIT_SCALE;
+  };
+
+  Uniforms *u = (Uniforms *)_uniformBuffer.contents;
+  u->camPos = camPos;
+  u->time = time;
+  u->camFwd = camFwd;
+  u->rs = g_params.rs;
+  u->camRight = camRight;
+  u->rin = g_params.rin;
+  u->camUp = camUp;
+  u->rout = g_params.rout;
+  u->tanHalfFov = tan((55.0f * M_PI / 180.0f) * 0.5f);
+  u->aspect = size.width / size.height;
+  u->dPhi = g_params.dPhi;
+  u->escapeR = g_params.escapeR;
+  u->diskBoost = g_params.diskBoost;
+  u->maxSteps = g_params.maxSteps;
+  u->debugView = g_params.debugView;
+  u->qualityLevel = (float)g_params.quality;
+  u->starPos = calcStarPos(STAR_S2);
+  u->starSize = g_params.starSize;
+  u->starColor = STAR_S2.color;
+  u->starBoost = g_params.starBoost;
+  u->star2Pos = calcStarPos(STAR_S55);
+  u->star2Size = g_params.starSize * 0.9f;
+  u->star2Color = STAR_S55.color;
+  u->star2Boost = g_params.starBoost * 1.2f;
+  u->star3Pos = calcStarPos(STAR_S38);
+  u->star3Size = g_params.starSize * 1.1f;
+  u->star3Color = STAR_S38.color;
+  u->star3Boost = g_params.starBoost * 1.3f;
+  u->star4Pos = calcStarPos(STAR_S29);
+  u->star4Size = g_params.starSize * 0.95f;
+  u->star4Color = STAR_S29.color;
+  u->star4Boost = g_params.starBoost * 1.25f;
+  u->star5Pos = calcStarPos(STAR_S4716);
+  u->star5Size = g_params.starSize * 0.8f;
+  u->star5Color = STAR_S4716.color;
+  u->star5Boost = g_params.starBoost * 1.5f;
+  u->width = _texWidth;
+  u->height = _texHeight;
+
+  id<MTLCommandBuffer> cmdBuffer = [_commandQueue commandBuffer];
+
+  id<MTLComputeCommandEncoder> computeEncoder =
+      [cmdBuffer computeCommandEncoder];
+  [computeEncoder setComputePipelineState:_computePipeline];
+  [computeEncoder setTexture:_renderTexture atIndex:0];
+  [computeEncoder setBuffer:_uniformBuffer offset:0 atIndex:0];
+  MTLSize tgSize = MTLSizeMake(16, 16, 1);
+  MTLSize tgCount =
+      MTLSizeMake((_texWidth + 15) / 16, (_texHeight + 15) / 16, 1);
+  [computeEncoder dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
+  [computeEncoder endEncoding];
+
+  MTLRenderPassDescriptor *passDesc = self.currentRenderPassDescriptor;
+  if (passDesc) {
+    id<MTLRenderCommandEncoder> renderEncoder =
+        [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
+    [renderEncoder setRenderPipelineState:_displayPipeline];
+    [renderEncoder setFragmentTexture:_renderTexture atIndex:0];
+    [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                      vertexStart:0
+                      vertexCount:3];
+    [renderEncoder endEncoding];
+    [cmdBuffer presentDrawable:self.currentDrawable];
+  }
+  [cmdBuffer commit];
+
+  g_frameCount++;
+  float currentTime = std::chrono::duration<float>(now - g_startTime).count();
+  if (currentTime - g_lastFPSTime > 1.0f) {
+    g_currentFPS = g_frameCount / (currentTime - g_lastFPSTime);
+    g_frameCount = 0;
+    g_lastFPSTime = currentTime;
+    const char *qn[] = {"Low", "Medium", "High", "Ultra"};
+    std::cout << "FPS: " << (int)g_currentFPS << " | " << _texWidth << "x"
+              << _texHeight << " | " << qn[(int)g_params.quality] << std::endl;
+  }
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (void)keyDown:(NSEvent *)event {
+  unichar key = [[[event charactersIgnoringModifiers] lowercaseString]
+      characterAtIndex:0];
+  switch (key) {
+  case 'w':
+    g_camera.keyW = true;
+    break;
+  case 'a':
+    g_camera.keyA = true;
+    break;
+  case 's':
+    g_camera.keyS = true;
+    break;
+  case 'd':
+    g_camera.keyD = true;
+    break;
+  case 'q':
+    g_camera.keyQ = true;
+    break;
+  case 'e':
+    g_camera.keyE = true;
+    break;
+  case 'z':
+  case NSUpArrowFunctionKey:
+    g_camera.keyZ = true;
+    break;
+  case 'x':
+  case NSDownArrowFunctionKey:
+    g_camera.keyX = true;
+    break;
+  case 'c':
+    g_camera.toggleMode();
+    break;
+  case 'v':
+    g_params.debugView = fmod(g_params.debugView + 1.0f, 4.0f);
+    break;
+  case 'f':
+    [self.window toggleFullScreen:nil];
+    break;
+  case '1':
+    g_params.setQuality(QualityPreset::Low);
+    std::cout << "Quality: Low" << std::endl;
+    break;
+  case '2':
+    g_params.setQuality(QualityPreset::Medium);
+    std::cout << "Quality: Medium" << std::endl;
+    break;
+  case '3':
+    g_params.setQuality(QualityPreset::High);
+    std::cout << "Quality: High" << std::endl;
+    break;
+  case '4':
+    g_params.setQuality(QualityPreset::Ultra);
+    std::cout << "Quality: Ultra" << std::endl;
+    break;
+  case 27:
+    [NSApp terminate:nil];
+    break;
+  }
+}
+
+- (void)keyUp:(NSEvent *)event {
+  unichar key = [[[event charactersIgnoringModifiers] lowercaseString]
+      characterAtIndex:0];
+  switch (key) {
+  case 'w':
+    g_camera.keyW = false;
+    break;
+  case 'a':
+    g_camera.keyA = false;
+    break;
+  case 's':
+    g_camera.keyS = false;
+    break;
+  case 'd':
+    g_camera.keyD = false;
+    break;
+  case 'q':
+    g_camera.keyQ = false;
+    break;
+  case 'e':
+    g_camera.keyE = false;
+    break;
+  case 'z':
+  case NSUpArrowFunctionKey:
+    g_camera.keyZ = false;
+    break;
+  case 'x':
+  case NSDownArrowFunctionKey:
+    g_camera.keyX = false;
+    break;
+  }
+}
+
+- (void)flagsChanged:(NSEvent *)event {
+  g_camera.keyShift = ([event modifierFlags] & NSEventModifierFlagShift) != 0;
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  g_camera.isDragging = true;
+  NSPoint loc = [event locationInWindow];
+  g_camera.lastMouseX = loc.x;
+  g_camera.lastMouseY = loc.y;
+}
+
+- (void)mouseUp:(NSEvent *)event {
+  g_camera.isDragging = false;
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+  if (!g_camera.isDragging)
+    return;
+  NSPoint loc = [event locationInWindow];
+  g_camera.onMouseDrag(loc.x - g_camera.lastMouseX,
+                       loc.y - g_camera.lastMouseY);
+  g_camera.lastMouseX = loc.x;
+  g_camera.lastMouseY = loc.y;
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+  g_camera.onScroll([event deltaY]);
+}
+
+@end
+
+// ============================================================================
+// App Delegate
+// ============================================================================
+
+@interface AppDelegate : NSObject <NSApplicationDelegate>
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) BlackHoleView *metalView;
+@end
+
+@implementation AppDelegate
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) {
+    NSLog(@"Metal not supported!");
+    [NSApp terminate:nil];
+    return;
+  }
+
+  NSLog(@"Metal device: %@", device.name);
+
+  NSScreen *screen = [NSScreen mainScreen];
+  NSRect screenFrame = [screen visibleFrame];
+  CGFloat width = fmin(3840, screenFrame.size.width * 0.9);
+  CGFloat height = fmin(2160, screenFrame.size.height * 0.9);
+  CGFloat x = (screenFrame.size.width - width) / 2 + screenFrame.origin.x;
+  CGFloat y = (screenFrame.size.height - height) / 2 + screenFrame.origin.y;
+
+  _window = [[NSWindow alloc]
+      initWithContentRect:NSMakeRect(x, y, width, height)
+                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                          NSWindowStyleMaskResizable |
+                          NSWindowStyleMaskMiniaturizable
+                  backing:NSBackingStoreBuffered
+                    defer:NO];
+  [_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+  [_window setTitle:@"Black Hole - Metal 4K"];
+
+  _metalView =
+      [[BlackHoleView alloc] initWithFrame:NSMakeRect(0, 0, width, height)
+                                    device:device];
+  [_window setContentView:_metalView];
+  [_window makeFirstResponder:_metalView];
+  [_window makeKeyAndOrderFront:nil];
+
+  std::cout << "\n============ Black Hole - Metal 4K ============\n";
+  std::cout << "Quality: HIGH (60+ FPS @ 4K)\n\n";
+  std::cout << "Controls:\n";
+  std::cout << "  Drag: Rotate | Scroll: Zoom | F: Fullscreen\n";
+  std::cout << "  C: Free camera | WASD/QE: Move | V: Debug\n";
+  std::cout << "  1-4: Quality presets | Esc: Quit\n";
+  std::cout << "================================================\n\n";
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:
+    (NSApplication *)sender {
+  return YES;
+}
+
+@end
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, const char *argv[]) {
+  (void)argc;
+  (void)argv;
+
+  @autoreleasepool {
+    NSApplication *app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    AppDelegate *delegate = [[AppDelegate alloc] init];
+    [app setDelegate:delegate];
+
+    NSMenu *menuBar = [[NSMenu alloc] init];
+    NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:appMenuItem];
+    NSMenu *appMenu = [[NSMenu alloc] init];
+    [appMenu addItemWithTitle:@"Quit"
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+    [appMenuItem setSubmenu:appMenu];
+    [app setMainMenu:menuBar];
+
+    [app activateIgnoringOtherApps:YES];
+    [app run];
+  }
+  return 0;
+}
