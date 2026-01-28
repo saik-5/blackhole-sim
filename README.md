@@ -78,3 +78,26 @@ You can adjust the simulation parameters at the top of `main_4k.mm` in the `SimP
 *   `diskBoost`: Adjusts the brightness of the accretion disk (currently set to `9.0f`).
 *   `rin` / `rout`: Adjusts the inner and outer radius of the accretion disk.
 *   `maxSteps`: Adjusts the ray-marching precision (also controlled by Quality presets).
+
+### Background Image Customization
+
+The simulation uses an environment map for the background stars (Einstein ring effect). You can customize this by:
+
+1.  **Changing the Image**: 
+    Place your desired image file (JPG/PNG) in the project directory.
+    Open `main_4k.mm` and find the `initWithFrame` method (around line 597).
+    Update the filename in the `loadSkyTexture` call:
+    ```objective-c
+    // Change "eso.jpg" to your filename
+    [self loadSkyTexture:@"your_image.jpg"];
+    ```
+
+2.  **Adjusting the Field of View (Zoom)**:
+    If your background image looks too zoomed in or out, you can tweak the mapping in the shader.
+    Open `main_4k.mm` and locate the `sampleSky` function (around line 360).
+    Change the `zoomFactor` value:
+    ```objective-c
+    // Lower values (e.g., 0.5) zoom in, higher values (e.g., 2.5) zoom out
+    float zoomFactor = 2.5; 
+    ```
+    Play with this number until the background wraps nicely for your specific image.

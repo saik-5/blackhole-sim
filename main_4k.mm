@@ -104,6 +104,11 @@ struct Uniforms {
   simd_float3 star5Color;
   float star5Boost;
 
+  float skyIntensity;
+  float skyRotation;
+  float _skyPad0;
+  float _skyPad1;
+
   uint32_t width;
   uint32_t height;
   uint32_t _pad0, _pad1;
@@ -126,6 +131,10 @@ struct SimParams {
   float debugView = 0.0f;
   float starSize = 1.0f;
   float starBoost = 6.0f;
+
+  float skyIntensity = 1.0f;
+  float skyRotation = 0.0f;
+
   QualityPreset quality = QualityPreset::High;
 
   void setQuality(QualityPreset q) {
@@ -309,6 +318,7 @@ struct Uniforms {
     float3 star3Pos; float star3Size; float3 star3Color; float star3Boost;
     float3 star4Pos; float star4Size; float3 star4Color; float star4Boost;
     float3 star5Pos; float star5Size; float3 star5Color; float star5Boost;
+    float skyIntensity; float skyRotation; float _skyPad0; float _skyPad1;
     uint width; uint height; uint _pad0; uint _pad1;
 };
 
@@ -340,8 +350,39 @@ inline float fbmDisk(float2 p, float lod) {
     return mix(0.5, f, baseVis);
 }
 
+
+inline float3 sampleSky(float3 rd, texture2d<float, access::sample> sky, 
+                        float rotation, float intensity) {
+    if (is_null_texture(sky)) return float3(0.0);
+
+    // Rotate ray direction around Y axis
+    float cosR = cos(rotation);
+    float sinR = sin(rotation);
+    float3 rotatedRd = float3(
+        rd.x * cosR - rd.z * sinR,
+        rd.y,
+        rd.x * sinR + rd.z * cosR
+    );
+    
+    // Spherical mapping with adjustable zoom
+    float zoomFactor = 2.5;  // User requested param (0.2-0.5 recommended)
+    float u = atan2(rotatedRd.z, rotatedRd.x) / (2.0 * 3.14159265) + 0.5;
+    float v = asin(clamp(rotatedRd.y, -1.0, 1.0)) / 3.14159265 + 0.5;
+
+    // Apply zoom (scales UV around center)
+    u = (u - 0.5) * zoomFactor + 0.5;
+    v = (v - 0.5) * zoomFactor + 0.5;
+    
+    constexpr sampler skySampler(filter::linear, address::repeat);
+    // Use explicit LOD 0 to avoid derivative issues in divergent flow control
+    float3 skyColor = sky.sample(skySampler, float2(u, v), level(0.0)).rgb;
+    
+    return skyColor * intensity;
+}
+
 kernel void blackHoleCompute(
     texture2d<float, access::write> output [[texture(0)]],
+    texture2d<float, access::sample> skyTexture [[texture(1)]],
     constant Uniforms& u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -436,15 +477,59 @@ kernel void blackHoleCompute(
         }
     }
     
+    // Debug Mode 4: Visualize Escaped Ray Direction
     if (dbg == 3) {
-        float4 col = (hitType == 2) ? float4(1,1,0,1) : (hitType == 1) ? float4(1,0,0,1) :
+        float4 col = (hitType == 2) ? float4(1,1,0,1) : (hitType == 1) ? float4(0,0,0,1) :
                      (hitType == 3) ? float4(0.1,0.3,1,1) : float4(0,0.6,0.2,1);
         output.write(col, gid);
         return;
     }
+
+    if (hitType == 3 && trans > 0.01) {
+        // Robustness Fix: Use numerical difference for direction
+        // The analytical derivative (-w * r) becomes unstable at large r
+        // because error in w is magnified by r. 
+        // using (p - pPrev) is numerically stable and sufficient.
+        
+        float3 escapedRayDir = normalize(p - p); // Fallback
+        if (length(p - pPrev) > 1e-6) {
+            escapedRayDir = normalize(p - pPrev);
+        } else {
+             // Fallback for extremely small steps
+             float3 radialDir = e1 * cos(phi) + e2 * sin(phi);
+             float3 tangentDir = -e1 * sin(phi) + e2 * cos(phi);
+             escapedRayDir = tangentDir;
+        }
+        
+        // "Glass Stretch" Fix 2.0:
+        // The user wants a MUCH sharper background far from the black hole.
+        // The previous blend was too gentle (0.9), leaving residual "glassy" distortion.
+        // We now enforce a hard transition back to the original ray direction 'rd'.
+        
+        float impactRatio = b / u.rs;
+        
+        // Transition range: [3.5 Rs, 6.0 Rs]
+        // Below 3.5: Full gravitational lensing (Einstein ring preserved)
+        // Above 6.0: Perfect straight-line transmission (Sharp background)
+        float stabilityFactor = smoothstep(3.5, 6.0, impactRatio);
+        
+        // Fully mix to 'rd' (1.0) instead of 0.9 to eliminate ALL distortion in the far field.
+        escapedRayDir = normalize(mix(escapedRayDir, rd, stabilityFactor)); 
+        
+        if (dbg == 4) {
+             output.write(float4(escapedRayDir * 0.5 + 0.5, 1.0), gid);
+             return;
+        }
+        
+        float3 skyColor = sampleSky(escapedRayDir, skyTexture, u.skyRotation, u.skyIntensity);
+        accum += skyColor * trans;
+    }
     
     output.write(float4(accum, 1.0), gid);
 }
+
+
+
 )";
 
 NSString *displayShaderSource = @R"(
@@ -492,6 +577,7 @@ static float g_currentFPS = 0.0f;
 @property(nonatomic, strong) id<MTLTexture> renderTexture;
 @property(nonatomic) uint32_t texWidth;
 @property(nonatomic) uint32_t texHeight;
+@property(nonatomic, strong) id<MTLTexture> skyTexture;
 @end
 
 @implementation BlackHoleView
@@ -539,8 +625,71 @@ static float g_currentFPS = 0.0f;
 
     g_startTime = std::chrono::high_resolution_clock::now();
     g_lastFrameTime = g_startTime;
+
+    // Load Sky Texture
+    [self loadSkyTexture:@"eso.jpg"];
   }
   return self;
+}
+
+- (void)loadSkyTexture:(NSString *)filename {
+  // Get path relative to executable or current directory
+  NSString *path = [[NSFileManager defaultManager] currentDirectoryPath];
+  path = [path stringByAppendingPathComponent:filename];
+
+  NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
+  if (!image) {
+    NSLog(@"Failed to load sky texture: %@", path);
+    return;
+  }
+
+  NSBitmapImageRep *bitmap = nil;
+  for (NSImageRep *rep in [image representations]) {
+    if ([rep isKindOfClass:[NSBitmapImageRep class]]) {
+      bitmap = (NSBitmapImageRep *)rep;
+      break;
+    }
+  }
+
+  if (!bitmap) {
+    // Fallback: create bitmap from image
+    bitmap = [[NSBitmapImageRep alloc] initWithData:[image TIFFRepresentation]];
+  }
+
+  if (!bitmap) {
+    NSLog(@"Failed to create bitmap from image: %@", path);
+    return;
+  }
+
+  MTLTextureDescriptor *desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                   width:bitmap.pixelsWide
+                                  height:bitmap.pixelsHigh
+                               mipmapped:YES];
+  desc.usage = MTLTextureUsageShaderRead;
+
+  _skyTexture = [self.device newTextureWithDescriptor:desc];
+
+  if (!_skyTexture) {
+    NSLog(@"Failed to create Metal texture from descriptor");
+    return;
+  }
+
+  [_skyTexture
+      replaceRegion:MTLRegionMake2D(0, 0, bitmap.pixelsWide, bitmap.pixelsHigh)
+        mipmapLevel:0
+          withBytes:bitmap.bitmapData
+        bytesPerRow:bitmap.bytesPerRow];
+
+  // Generate mipmaps
+  id<MTLCommandBuffer> cmdBuf = [_commandQueue commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+  [blit generateMipmapsForTexture:_skyTexture];
+  [blit endEncoding];
+  [cmdBuf commit];
+  [cmdBuf waitUntilCompleted];
+
+  std::cout << "Loaded sky texture: " << [filename UTF8String] << std::endl;
 }
 
 - (void)createTextureWithWidth:(uint32_t)width height:(uint32_t)height {
@@ -617,6 +766,8 @@ static float g_currentFPS = 0.0f;
   u->star5Size = g_params.starSize * 0.8f;
   u->star5Color = STAR_S4716.color;
   u->star5Boost = g_params.starBoost * 1.5f;
+  u->skyIntensity = g_params.skyIntensity;
+  u->skyRotation = g_params.skyRotation;
   u->width = _texWidth;
   u->height = _texHeight;
 
@@ -626,6 +777,9 @@ static float g_currentFPS = 0.0f;
       [cmdBuffer computeCommandEncoder];
   [computeEncoder setComputePipelineState:_computePipeline];
   [computeEncoder setTexture:_renderTexture atIndex:0];
+  if (_skyTexture) {
+    [computeEncoder setTexture:_skyTexture atIndex:1];
+  }
   [computeEncoder setBuffer:_uniformBuffer offset:0 atIndex:0];
   MTLSize tgSize = MTLSizeMake(16, 16, 1);
   MTLSize tgCount =
