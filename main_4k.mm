@@ -21,6 +21,9 @@ struct StarData {
   simd_float3 color;
 };
 
+// Global State Declaration (needed for Camera access)
+static simd_float3 g_blackHolePos = {0.0f, 0.0f, 0.0f};
+
 const StarData STAR_S2 = {"S2",      0.1251f * 8178.0f, 0.8843f,
                           133.91f,   228.07f,           66.25f,
                           2018.379f, 16.0518f,          {0.70f, 0.85f, 1.00f}};
@@ -127,7 +130,7 @@ struct SimParams {
   int maxSteps = 200;
   float dPhi = 0.05f;
   float escapeR = 5000.0f;
-  float diskBoost = 9.0f;
+  float diskBoost = 5.0f;
   float debugView = 0.0f;
   float starSize = 1.0f;
   float starBoost = 6.0f;
@@ -221,6 +224,7 @@ public:
   bool keyQ = false, keyE = false, keyShift = false;
   bool keyZ = false, keyX = false;
   bool keyK = false, keyL = false;
+  bool keyT = false, keyG = false;
   bool keyLeft = false, keyRight = false;
   bool isDragging = false;
   float lastMouseX = 0.0f, lastMouseY = 0.0f;
@@ -268,9 +272,17 @@ public:
     if (keyL)
       roll += rollSpeed;
 
+    // Black Hole Vertical Movement
+    float bhMoveSpeed = 5.0f * dt;
+    if (keyT)
+      g_blackHolePos.y += bhMoveSpeed;
+    if (keyG)
+      g_blackHolePos.y -= bhMoveSpeed;
+
     // Orbit Control (Arrow Keys) matching mouse drag
     // Mouse drag uses theta += dx * 0.01f
-    float orbitSpeed = 1.5f * dt;
+    // Reduced speed for smoother control (was 1.5f)
+    float orbitSpeed = 0.3f * dt;
     if (keyLeft)
       theta += orbitSpeed; // Similar to dragging right
     if (keyRight)
@@ -350,10 +362,29 @@ struct Uniforms {
     uint width; uint height; uint _pad0; uint _pad1;
 };
 
+inline float hash(float2 p) {
+    return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+inline float noiseRaw(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    return mix(
+        mix(hash(i), hash(i + float2(1.0, 0.0)), u.x),
+        mix(hash(i + float2(0.0, 1.0)), hash(i + float2(1.0, 1.0)), u.x),
+        u.y
+    );
+}
+
+inline float noise(float2 p, float lod) {
+    float intensity = 1.0 - smoothstep(1.0, 4.0, lod);
+    if (intensity < 0.01) return 0.5;
+    return mix(0.5, noiseRaw(p), intensity);
+}
+
 inline float hash3(float3 p) {
-    p = fract(p * 0.1031);
-    p += dot(p, p.yzx + 33.33);
-    return fract((p.x + p.y) * p.z);
+    return fract(sin(dot(p, float3(12.9898, 78.233, 45.164))) * 43758.5453);
 }
 
 inline float noise3D(float3 p) {
@@ -366,16 +397,17 @@ inline float noise3D(float3 p) {
 }
 
 inline float fbmDisk(float2 p, float lod) {
-    float3 pos3D = float3(p.x, cos(p.y / 2.0) * 2.0, sin(p.y / 2.0) * 2.0);
-    float f = 0.5 * noise3D(pos3D);
+    float r = p.x / 12.0;
+    float ang = p.y / 2.0;
+    float ringScale = 2.0;
+    float3 pos3D = float3(r * 12.0, cos(ang) * ringScale, sin(ang) * ringScale);
     
-    // Detail octave: smooth fade out between LOD 1.0 and 2.5
-    float detailVis = 1.0 - smoothstep(1.0, 2.5, lod);
-    f += 0.25 * noise3D(pos3D * 2.02) * detailVis;
+    float f = 0.0;
+    f += 0.5 * noise3D(pos3D); pos3D *= 2.02;
+    f += 0.25 * noise3D(pos3D); pos3D *= 2.03;
+    f += 0.125 * noise3D(pos3D);
     
-    // Base octave: smooth fade to grey between LOD 2.5 and 5.0
-    float baseVis = 1.0 - smoothstep(2.5, 5.0, lod);
-    return mix(0.5, f, baseVis);
+    return f;
 }
 
 
@@ -393,7 +425,7 @@ inline float3 sampleSky(float3 rd, texture2d<float, access::sample> sky,
     );
     
     // Spherical mapping with adjustable zoom
-    float zoomFactor = 2.5;  // User requested param (0.2-0.5 recommended)
+    float zoomFactor = 3.0;  // User requested param (0.2-0.5 recommended)
     float u = atan2(rotatedRd.z, rotatedRd.x) / (2.0 * 3.14159265) + 0.5;
     float v = asin(clamp(rotatedRd.y, -1.0, 1.0)) / 3.14159265 + 0.5;
 
@@ -476,24 +508,38 @@ kernel void blackHoleCompute(
             float rr = length(float2(phit.x, phit.z));
             
             if (rr > u.rin && rr < u.rout) {
-                float ang = atan2(phit.z, phit.x) + u.time * 6.0 / sqrt(rr) * 0.2;
+                float ang = atan2(phit.z, phit.x);
+                float speed = 6.0 / sqrt(rr);
+                float rotAngle = ang + u.time * speed * 0.2;
                 float dist = length(phit - u.camPos);
-                // Increased LOD factor from 40.0 to 100.0 to reduce Moire
-                float texLOD = (u.tanHalfFov * dist * 2.0) / 800.0 * 100.0;
                 
-                float n = fbmDisk(float2(rr * 12.0, ang * 2.0), texLOD);
+                // Match JS LOD calculation
+                float pixelSize = (u.tanHalfFov * dist * 2.0) / float(u.height);
+                float texLOD = pixelSize * 40.0;
+                
+                float n = fbmDisk(float2(rr * 12.0, rotAngle * 2.0), texLOD);
+                
                 float filaments = smoothstep(0.2, 0.8, n);
-                float alpha = smoothstep(u.rin, u.rin + 1.0, rr) * 
-                              (1.0 - smoothstep(u.rout - 4.0, u.rout, rr));
+                float detail = noise(float2(rr * 40.0, rotAngle * 4.0), texLOD * 3.0);
+                filaments += detail * 0.2;
+
+                float alphaInner = smoothstep(u.rin, u.rin + 1.0, rr);
+                float alphaOuter = 1.0 - smoothstep(u.rout - 4.0, u.rout, rr);
+                float alpha = alphaInner * alphaOuter;
                 
                 float temp = pow(u.rin / rr, 1.5);
                 float3 blackbody = mix(float3(0.8, 0.1, 0.01), float3(1.0, 0.9, 0.8), saturate(temp));
                 
                 float3 vdir = normalize(float3(-phit.z, 0.0, phit.x));
                 float vmag = min(sqrt(u.rs / (2.0 * rr)), 0.7);
-                float doppler = 1.0 / (1.0 - vmag * dot(vdir, -normalize(p - pPrev)));
+                float3 rayDirAtHit = normalize(p - pPrev);
+                float mu = dot(vdir, -rayDirAtHit);
+                float gamma = 1.0 / sqrt(1.0 - vmag * vmag);
+                float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
+                float beamBase = max(doppler, 0.0);
+                float beaming = beamBase * beamBase * beamBase;
                 
-                float3 diskCol = blackbody * filaments * doppler * doppler * doppler * u.diskBoost;
+                float3 diskCol = blackbody * filaments * beaming * u.diskBoost;
                 float diskOpacity = saturate(alpha * 0.65);
                 
                 accum += diskCol * diskOpacity * trans;
@@ -586,6 +632,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], texture2d<float> tex [[t
 
 static Camera g_camera;
 static SimParams g_params;
+// static simd_float3 g_blackHolePos = {0.0f, 0.0f, 0.0f}; // Moved to top
 static float g_simYear = 2024.0f;
 static std::chrono::high_resolution_clock::time_point g_startTime;
 static std::chrono::high_resolution_clock::time_point g_lastFrameTime;
@@ -606,6 +653,7 @@ static float g_currentFPS = 0.0f;
 @property(nonatomic) uint32_t texWidth;
 @property(nonatomic) uint32_t texHeight;
 @property(nonatomic, strong) id<MTLTexture> skyTexture;
+@property(nonatomic, strong) NSTextField *debugLabel;
 @end
 
 @implementation BlackHoleView
@@ -656,8 +704,29 @@ static float g_currentFPS = 0.0f;
 
     // Load Sky Texture
     [self loadSkyTexture:@"eso.jpg"];
+
+    // Initialize Debug Overlay
+    _debugLabel =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 300, 250)];
+    [_debugLabel setEditable:NO];
+    [_debugLabel setSelectable:NO];
+    [_debugLabel setBezeled:NO];
+    [_debugLabel setDrawsBackground:NO];
+    [_debugLabel setTextColor:[NSColor whiteColor]];
+    [_debugLabel setFont:[NSFont fontWithName:@"Menlo" size:12]];
+    [_debugLabel setAlignment:NSTextAlignmentRight];
+    [_debugLabel setStringValue:@"Initializing..."];
+    [self addSubview:_debugLabel];
   }
   return self;
+}
+
+- (void)layout {
+  [super layout];
+  NSRect bounds = self.bounds;
+  // Position in top right with 20px padding
+  [_debugLabel setFrame:NSMakeRect(bounds.size.width - 320,
+                                   bounds.size.height - 270, 300, 250)];
 }
 
 - (void)loadSkyTexture:(NSString *)filename {
@@ -758,7 +827,9 @@ static float g_currentFPS = 0.0f;
   };
 
   Uniforms *u = (Uniforms *)_uniformBuffer.contents;
-  u->camPos = camPos;
+  // Adjust camera position relative to Black Hole for the shader
+  // The shader assumes BH is at (0,0,0), so we shift the camera by -bhPos
+  u->camPos = camPos - g_blackHolePos;
   u->time = time;
   u->camFwd = camFwd;
   u->rs = g_params.rs;
@@ -839,6 +910,29 @@ static float g_currentFPS = 0.0f;
     std::cout << "FPS: " << (int)g_currentFPS << " | " << _texWidth << "x"
               << _texHeight << " | " << qn[(int)g_params.quality] << std::endl;
   }
+
+  // Update Debug Overlay every frame
+  NSString *debugInfo = [NSString
+      stringWithFormat:@"--- CAMERA ---\n"
+                       @"Pos: %.2f, %.2f, %.2f\n"
+                       @"Dist: %.2f | Roll: %.2f\n"
+                       @"Theta: %.2f | Phi: %.2f\n"
+                       @"\n--- DISK ---\n"
+                       @"Rs: %.2f | Boost: %.2f\n"
+                       @"Rin: %.2f | Rout: %.2f\n"
+                       @"\n--- SKY ---\n"
+                       @"Int: %.2f | Rot: %.2f\n"
+                       @"\n--- SYSTEM ---\n"
+                       @"FPS: %d | Res: %dx%d\n"
+                       @"\n--- BLACK HOLE ---\n"
+                       @"Pos: %.2f, %.2f, %.2f",
+                       camPos.x, camPos.y, camPos.z, g_camera.distance,
+                       g_camera.roll, g_camera.theta, g_camera.phi, g_params.rs,
+                       g_params.diskBoost, g_params.rin, g_params.rout,
+                       g_params.skyIntensity, g_params.skyRotation,
+                       (int)g_currentFPS, _texWidth, _texHeight,
+                       g_blackHolePos.x, g_blackHolePos.y, g_blackHolePos.z];
+  [_debugLabel setStringValue:debugInfo];
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -886,6 +980,12 @@ static float g_currentFPS = 0.0f;
     break;
   case 'l':
     g_camera.keyL = true;
+    break;
+  case 't':
+    g_camera.keyT = true;
+    break;
+  case 'g':
+    g_camera.keyG = true;
     break;
   case 'c':
     g_camera.toggleMode();
@@ -959,6 +1059,12 @@ static float g_currentFPS = 0.0f;
     break;
   case 'l':
     g_camera.keyL = false;
+    break;
+  case 't':
+    g_camera.keyT = false;
+    break;
+  case 'g':
+    g_camera.keyG = false;
     break;
   }
 }

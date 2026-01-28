@@ -10,6 +10,7 @@ A high-performance, real-time Schwarzschild black hole ray tracer written in pur
 *   **Accretion Disk**: Volumetric rendering of a relativistic accretion disk with Doppler shifting and beaming effects.
 *   **Zero Dependencies**: Written in pure Objective-C++ and Metal, requiring no external libraries (uses standard macOS frameworks).
 *   **Interactive Camera**: Switch between an orbital view and a free-flight mode to explore the scene.
+*   **Real-time HUD**: Live debug overlay showing camera coordinates, black hole position, and orbital parameters.
 *   **Quality Presets**: Adjustable rendering settings (Low to Ultra) to balance performance and visual fidelity.
 
 ## Requirements
@@ -65,6 +66,13 @@ make run-4k
 | **A / D** | Move Left / Right |
 | **Q / E** | Move Down / Up |
 | **Shift** | Boost movement speed |
+| **K / L** | Roll Camera Left / Right |
+
+### Simulation Controls
+| Key | Action |
+| :--- | :--- |
+| **T / G** | Move Black Hole Up / Down (Y-Axis) |
+
 
 ## Technical Implementation Details
 
@@ -75,7 +83,7 @@ make run-4k
 ## Customization
 
 You can adjust the simulation parameters at the top of `main_4k.mm` in the `SimParams` struct:
-*   `diskBoost`: Adjusts the brightness of the accretion disk (currently set to `9.0f`).
+*   `diskBoost`: Adjusts the brightness of the accretion disk.
 *   `rin` / `rout`: Adjusts the inner and outer radius of the accretion disk.
 *   `maxSteps`: Adjusts the ray-marching precision (also controlled by Quality presets).
 
