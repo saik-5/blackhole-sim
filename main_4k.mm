@@ -126,6 +126,10 @@ struct DisplayUniforms {
   float contrast;
   float saturation;
   float bloomStrength;
+  float vignetteStrength;
+  float chromaticAberration;
+  float grainStrength;
+  float time;
 };
 
 enum class QualityPreset { Low, Medium, High, Ultra };
@@ -151,7 +155,10 @@ struct SimParams {
   float exposure = 0.2f;
   float contrast = 1.0f;
   float saturation = 2.0f;
-  float bloomStrength = 0.5f; // New default
+  float bloomStrength = 0.5f;
+  float vignetteStrength = 0.5f;
+  float chromaticAberration = 0.002f;
+  float grainStrength = 0.0f; // Default Off
 
   QualityPreset quality = QualityPreset::High;
 
@@ -568,7 +575,8 @@ kernel void blackHoleCompute(
                 float3 rayDirAtHit = normalize(p - pPrev);
                 float mu = dot(vdir, -rayDirAtHit);
                 float gamma = 1.0 / sqrt(1.0 - vmag * vmag);
-                float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
+                float gravShift = sqrt(max(0.0, 1.0 - u.rs / rr)); // Gravitational Redshift
+                float doppler = (1.0 / (gamma * (1.0 - vmag * mu))) * gravShift;
                 
                 // 2. Apply Doppler shift to temperature (System 1.5)
                 float baseTemp = u.diskBaseTemp * pow(u.rin / rr, 0.75);
@@ -721,8 +729,18 @@ struct DisplayUniforms {
     float exposure;
     float contrast;
     float saturation;
-    float bloomStrength; // New
+    float bloomStrength;
+    float vignetteStrength;
+    float chromaticAberration;
+    float grainStrength;
+    float time;
 };
+
+float hash12(float2 p) {
+	float3 p3  = fract(float3(p.xyx) * .1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
 
 inline float3 ACESFilm(float3 x) {
     float a = 2.51;
@@ -752,11 +770,27 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]],
                              texture2d<float> bloomTex [[texture(1)]],
                              constant DisplayUniforms& u [[buffer(0)]]) {
     constexpr sampler s(filter::linear);
-    float3 hdr = tex.sample(s, in.uv).rgb;
+    
+    // Chromatic Aberration
+    float2 center = float2(0.5, 0.5);
+    float2 dist = in.uv - center;
+    float2 offset = dist * u.chromaticAberration;
+    
+    float3 hdr;
+    hdr.r = tex.sample(s, in.uv - offset).r;
+    hdr.g = tex.sample(s, in.uv).g;
+    hdr.b = tex.sample(s, in.uv + offset).b;
+
+    // float3 hdr = tex.sample(s, in.uv).rgb; // OLD
     float3 bloom = bloomTex.sample(s, in.uv).rgb;
     
     // Add Bloom (before tonemapping)
     hdr += bloom * u.bloomStrength;
+    
+    // 0. Vignette (Physical light reduction at edges)
+    float2 uvCoords = in.uv * 2.0 - 1.0;
+    float vignette = 1.0 - dot(uvCoords, uvCoords) * u.vignetteStrength;
+    hdr *= saturate(vignette);
     
     // 1. Exposure
     hdr *= u.exposure;
@@ -774,7 +808,13 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]],
     // 4. Tonemap (HDR -> LDR)
     float3 ldr = ACESFilm(hdr);
     
-    // 5. Gamma Correction (Linear -> sRGB)
+    // 5. Film Grain
+    if (u.grainStrength > 0.0) {
+        float noise = hash12(in.uv * u.time * 10.0);
+        ldr += (noise * 2.0 - 1.0) * u.grainStrength;
+    }
+    
+    // 6. Gamma Correction (Linear -> sRGB)
     float3 srgb = linearToSRGB(ldr);
     
     return float4(srgb, 1.0);
@@ -821,6 +861,8 @@ static float g_currentFPS = 0.0f;
 @property(nonatomic, strong) NSTextField *satLabel;
 @property(nonatomic, strong) NSSlider *bloomSlider;
 @property(nonatomic, strong) NSTextField *bloomLabel;
+@property(nonatomic, strong) NSSlider *grainSlider;
+@property(nonatomic, strong) NSTextField *grainLabel;
 @end
 
 @implementation BlackHoleView
@@ -984,6 +1026,35 @@ static float g_currentFPS = 0.0f;
   [_bloomSlider setTarget:self];
   [_bloomSlider setAction:@selector(onBloomChanged:)];
   [self addSubview:_bloomSlider];
+
+  // 6. Film Grain Slider
+  _grainLabel =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(20, 250, 200, 20)];
+  [_grainLabel setEditable:NO];
+  [_grainLabel setSelectable:NO];
+  [_grainLabel setBezeled:NO];
+  [_grainLabel setDrawsBackground:NO];
+  [_grainLabel setTextColor:[NSColor whiteColor]];
+  [_grainLabel
+      setStringValue:[NSString
+                         stringWithFormat:@"Grain: %.2f",
+                                          g_params.grainStrength / 0.04f]];
+  [self addSubview:_grainLabel];
+
+  _grainSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 230, 200, 20)];
+  [_grainSlider setMinValue:0.0];
+  [_grainSlider setMaxValue:1.0];                              // UI scale 0..1
+  [_grainSlider setFloatValue:g_params.grainStrength / 0.04f]; // Map back to UI
+  [_grainSlider setTarget:self];
+  [_grainSlider setAction:@selector(onGrainChanged:)];
+  [self addSubview:_grainSlider];
+}
+
+- (void)onGrainChanged:(id)sender {
+  float uiVal = [_grainSlider floatValue];
+  g_params.grainStrength = uiVal * 0.04f; // Map 0..1 -> 0..0.04
+  [_grainLabel
+      setStringValue:[NSString stringWithFormat:@"Grain: %.2f", uiVal]];
 }
 
 - (void)onTempSliderChanged:(id)sender {
@@ -1247,6 +1318,10 @@ static float g_currentFPS = 0.0f;
     du->contrast = g_params.contrast;
     du->saturation = g_params.saturation;
     du->bloomStrength = g_params.bloomStrength;
+    du->vignetteStrength = g_params.vignetteStrength;
+    du->chromaticAberration = g_params.chromaticAberration;
+    du->grainStrength = g_params.grainStrength;
+    du->time = time;
 
     id<MTLRenderCommandEncoder> renderEncoder =
         [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
