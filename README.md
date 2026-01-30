@@ -7,10 +7,12 @@ A high-performance, real-time Schwarzschild black hole ray tracer written in pur
 ## Features
 
 *   **Real-time Ray Tracing**: Solves the geodesic equations for photons in curved spacetime to render accurate gravitational lensing.
-*   **Accretion Disk**: Volumetric rendering of a relativistic accretion disk with Doppler shifting and beaming effects.
+*   **Physically Based Accretion Disk**: Volumetric rendering with **blackbody radiation** models and relativistic **Doppler color shifting** (redshift/blueshift).
+*   **Gravitational Lensing**: Lenses the actual background sky (Milky Way), creating accurate Einstein rings.
 *   **Zero Dependencies**: Written in pure Objective-C++ and Metal, requiring no external libraries (uses standard macOS frameworks).
 *   **Interactive Camera**: Switch between an orbital view and a free-flight mode to explore the scene.
 *   **Real-time HUD**: Live debug overlay showing camera coordinates, black hole position, and orbital parameters.
+*   **Dynamic Controls**: Real-time slider to adjust accretion disk temperature (0K - 100,000K).
 *   **Quality Presets**: Adjustable rendering settings (Low to Ultra) to balance performance and visual fidelity.
 
 ## Requirements
