@@ -109,7 +109,7 @@ struct Uniforms {
 
   float skyIntensity;
   float skyRotation;
-  float _skyPad0;
+  float diskBaseTemp;
   float _skyPad1;
 
   uint32_t width;
@@ -137,6 +137,7 @@ struct SimParams {
 
   float skyIntensity = 1.0f;
   float skyRotation = 0.0f;
+  float diskBaseTemp = 1000.0f;
 
   QualityPreset quality = QualityPreset::High;
 
@@ -358,7 +359,7 @@ struct Uniforms {
     float3 star3Pos; float star3Size; float3 star3Color; float star3Boost;
     float3 star4Pos; float star4Size; float3 star4Color; float star4Boost;
     float3 star5Pos; float star5Size; float3 star5Color; float star5Boost;
-    float skyIntensity; float skyRotation; float _skyPad0; float _skyPad1;
+    float skyIntensity; float skyRotation; float diskBaseTemp; float _skyPad1;
     uint width; uint height; uint _pad0; uint _pad1;
 };
 
@@ -408,6 +409,40 @@ inline float fbmDisk(float2 p, float lod) {
     f += 0.125 * noise3D(pos3D);
     
     return f;
+}
+
+inline float3 blackbodyColor(float t) {
+    // Smooth gradient based on temperature chunks
+    // To avoid banding, we use linear interpolation between control points.
+    
+    float3 col = float3(0.0);
+    
+    // Control points corresponding to realistic blackbody visual sequence
+    const float3 c_1 = float3(0.8, 0.0, 0.0);   // 1000K - Dim Red
+    const float3 c_2 = float3(1.0, 0.5, 0.0);   // 3000K - Orange
+    const float3 c_3 = float3(1.0, 0.95, 0.8);  // 6000K - Warm White
+    const float3 c_4 = float3(0.7, 0.8, 1.0);   // 10000K - Blue White
+    const float3 c_5 = float3(0.4, 0.6, 1.0);   // 20000K+ - Deep Blue
+    
+    if (t < 1000.0) {
+        // Fade out to black below 1000K
+        col = mix(float3(0.0), c_1, t / 1000.0);
+    } 
+    else if (t < 3000.0) {
+        col = mix(c_1, c_2, (t - 1000.0) / 2000.0);
+    }
+    else if (t < 6000.0) {
+        col = mix(c_2, c_3, (t - 3000.0) / 3000.0);
+    }
+    else if (t < 10000.0) {
+        col = mix(c_3, c_4, (t - 6000.0) / 4000.0);
+    }
+    else {
+        // Cap transition at 25000K
+        col = mix(c_4, c_5, saturate((t - 10000.0) / 15000.0));
+    }
+    
+    return col;
 }
 
 
@@ -508,6 +543,22 @@ kernel void blackHoleCompute(
             float rr = length(float2(phit.x, phit.z));
             
             if (rr > u.rin && rr < u.rout) {
+                // 1. Calculate velocities and Doppler factor FIRST
+                float3 vdir = normalize(float3(-phit.z, 0.0, phit.x));
+                float vmag = min(sqrt(u.rs / (2.0 * rr)), 0.7);
+                float3 rayDirAtHit = normalize(p - pPrev);
+                float mu = dot(vdir, -rayDirAtHit);
+                float gamma = 1.0 / sqrt(1.0 - vmag * vmag);
+                float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
+                
+                // 2. Apply Doppler shift to temperature (System 1.5)
+                // The approaching side (doppler > 1) becomes hotter/bluer
+                // The receding side (doppler < 1) becomes cooler/redder
+                float baseTemp = u.diskBaseTemp * pow(u.rin / rr, 0.75);
+                float observedTemp = baseTemp * doppler;
+                float3 blackbody = blackbodyColor(observedTemp);
+
+                // 3. Render disk details
                 float ang = atan2(phit.z, phit.x);
                 float speed = 6.0 / sqrt(rr);
                 float rotAngle = ang + u.time * speed * 0.2;
@@ -527,17 +578,16 @@ kernel void blackHoleCompute(
                 float alphaOuter = 1.0 - smoothstep(u.rout - 4.0, u.rout, rr);
                 float alpha = alphaInner * alphaOuter;
                 
-                float temp = pow(u.rin / rr, 1.5);
-                float3 blackbody = mix(float3(0.8, 0.1, 0.01), float3(1.0, 0.9, 0.8), saturate(temp));
+                // 4. Combine (Beaming is D^3, but we used D^1 for temp, so we need D^4 total?)
+                // Actually, standard relativity says Intensity I_obs = D^4 * I_emit
+                // Our blackbody function returns normalized color (0-1).
+                // We typically separate color (freq shift) and brightness (time dilation + number count).
+                // Let's stick to the spec: "Intensity still scales as D^4... but baked D into temp?"
+                // The spec says: "But we've already baked D into the temperature, so we use D^3 for remaining intensity"
+                // Let's follow that.
                 
-                float3 vdir = normalize(float3(-phit.z, 0.0, phit.x));
-                float vmag = min(sqrt(u.rs / (2.0 * rr)), 0.7);
-                float3 rayDirAtHit = normalize(p - pPrev);
-                float mu = dot(vdir, -rayDirAtHit);
-                float gamma = 1.0 / sqrt(1.0 - vmag * vmag);
-                float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
                 float beamBase = max(doppler, 0.0);
-                float beaming = beamBase * beamBase * beamBase;
+                float beaming = beamBase * beamBase * beamBase; // D^3 remaining
                 
                 float3 diskCol = blackbody * filaments * beaming * u.diskBoost;
                 float diskOpacity = saturate(alpha * 0.65);
@@ -654,6 +704,8 @@ static float g_currentFPS = 0.0f;
 @property(nonatomic) uint32_t texHeight;
 @property(nonatomic, strong) id<MTLTexture> skyTexture;
 @property(nonatomic, strong) NSTextField *debugLabel;
+@property(nonatomic, strong) NSSlider *tempSlider;
+@property(nonatomic, strong) NSTextField *tempValueLabel;
 @end
 
 @implementation BlackHoleView
@@ -717,8 +769,47 @@ static float g_currentFPS = 0.0f;
     [_debugLabel setAlignment:NSTextAlignmentRight];
     [_debugLabel setStringValue:@"Initializing..."];
     [self addSubview:_debugLabel];
+
+    // Initialize Temperature Slider (Standalone Debug UI)
+    [self setupDebugUI];
   }
   return self;
+}
+
+// Standalone function for Debug UI (Easy to remove/disable)
+- (void)setupDebugUI {
+  // 1. Label
+  _tempValueLabel =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(20, 60, 200, 20)];
+  [_tempValueLabel setEditable:NO];
+  [_tempValueLabel setSelectable:NO];
+  [_tempValueLabel setBezeled:NO];
+  [_tempValueLabel setDrawsBackground:NO];
+  [_tempValueLabel setTextColor:[NSColor whiteColor]];
+  [_tempValueLabel setFont:[NSFont systemFontOfSize:12]];
+  [_tempValueLabel
+      setStringValue:[NSString stringWithFormat:@"Temp: %.0f K",
+                                                g_params.diskBaseTemp]];
+  [self addSubview:_tempValueLabel];
+
+  // 2. Slider
+  _tempSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 30, 200, 20)];
+  [_tempSlider setMinValue:0.0];
+  [_tempSlider setMaxValue:100000.0];
+  [_tempSlider setFloatValue:g_params.diskBaseTemp];
+  [_tempSlider setTarget:self];
+  [_tempSlider setAction:@selector(onTempSliderChanged:)];
+  [self addSubview:_tempSlider];
+}
+
+- (void)onTempSliderChanged:(id)sender {
+  float newVal = [_tempSlider floatValue];
+  g_params.diskBaseTemp = newVal;
+  [_tempValueLabel
+      setStringValue:[NSString stringWithFormat:@"Temp: %.0f K", newVal]];
+
+  // Ensure view keeps focus for keyboard controls
+  // [self.window makeFirstResponder:self];
 }
 
 - (void)layout {
@@ -867,6 +958,7 @@ static float g_currentFPS = 0.0f;
   u->star5Boost = g_params.starBoost * 1.5f;
   u->skyIntensity = g_params.skyIntensity;
   u->skyRotation = g_params.skyRotation;
+  u->diskBaseTemp = g_params.diskBaseTemp;
   u->width = _texWidth;
   u->height = _texHeight;
 
