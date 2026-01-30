@@ -110,7 +110,7 @@ struct Uniforms {
   float skyIntensity;
   float skyRotation;
   float diskBaseTemp;
-  float _skyPad1;
+  int32_t maxDiskCrossings;
 
   uint32_t width;
   uint32_t height;
@@ -137,7 +137,8 @@ struct SimParams {
 
   float skyIntensity = 1.0f;
   float skyRotation = 0.0f;
-  float diskBaseTemp = 1000.0f;
+  float diskBaseTemp = 8000.0f;
+  int32_t maxDiskCrossings = 1;
 
   QualityPreset quality = QualityPreset::High;
 
@@ -148,21 +149,25 @@ struct SimParams {
       maxSteps = 100;
       dPhi = 0.08f;
       escapeR = 2000.0f;
+      maxDiskCrossings = 1;
       break;
     case QualityPreset::Medium:
       maxSteps = 150;
       dPhi = 0.06f;
       escapeR = 3000.0f;
+      maxDiskCrossings = 2;
       break;
     case QualityPreset::High:
       maxSteps = 200;
       dPhi = 0.05f;
       escapeR = 5000.0f;
+      maxDiskCrossings = 3;
       break;
     case QualityPreset::Ultra:
       maxSteps = 300;
       dPhi = 0.04f;
       escapeR = 10000.0f;
+      maxDiskCrossings = 8;
       break;
     }
   }
@@ -359,7 +364,7 @@ struct Uniforms {
     float3 star3Pos; float star3Size; float3 star3Color; float star3Boost;
     float3 star4Pos; float star4Size; float3 star4Color; float star4Boost;
     float3 star5Pos; float star5Size; float3 star5Color; float star5Boost;
-    float skyIntensity; float skyRotation; float diskBaseTemp; float _skyPad1;
+    float skyIntensity; float skyRotation; float diskBaseTemp; int maxDiskCrossings;
     uint width; uint height; uint _pad0; uint _pad1;
 };
 
@@ -510,7 +515,7 @@ kernel void blackHoleCompute(
     
     float3 pPrev = ro, p = ro;
     int hitType = 0;
-    bool didHitDisk = false;
+    int diskCrossings = 0; // REPLACED: bool didHitDisk = false;
     float trans = 1.0;
     float3 accum = float3(0.0);
     
@@ -537,7 +542,8 @@ kernel void blackHoleCompute(
         if (r < u.rs * 1.001) { hitType = 1; break; }
         if (r > u.escapeR) { hitType = 3; break; }
         
-        if (pPrev.y * p.y < 0.0 && !didHitDisk) {
+        // MULTI-HIT LOGIC: Check counter instead of boolean
+        if (pPrev.y * p.y < 0.0 && diskCrossings < u.maxDiskCrossings) {
             float t = pPrev.y / (pPrev.y - p.y);
             float3 phit = mix(pPrev, p, t);
             float rr = length(float2(phit.x, phit.z));
@@ -552,8 +558,6 @@ kernel void blackHoleCompute(
                 float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
                 
                 // 2. Apply Doppler shift to temperature (System 1.5)
-                // The approaching side (doppler > 1) becomes hotter/bluer
-                // The receding side (doppler < 1) becomes cooler/redder
                 float baseTemp = u.diskBaseTemp * pow(u.rin / rr, 0.75);
                 float observedTemp = baseTemp * doppler;
                 float3 blackbody = blackbodyColor(observedTemp);
@@ -578,25 +582,23 @@ kernel void blackHoleCompute(
                 float alphaOuter = 1.0 - smoothstep(u.rout - 4.0, u.rout, rr);
                 float alpha = alphaInner * alphaOuter;
                 
-                // 4. Combine (Beaming is D^3, but we used D^1 for temp, so we need D^4 total?)
-                // Actually, standard relativity says Intensity I_obs = D^4 * I_emit
-                // Our blackbody function returns normalized color (0-1).
-                // We typically separate color (freq shift) and brightness (time dilation + number count).
-                // Let's stick to the spec: "Intensity still scales as D^4... but baked D into temp?"
-                // The spec says: "But we've already baked D into the temperature, so we use D^3 for remaining intensity"
-                // Let's follow that.
-                
+                // 4. Combine
                 float beamBase = max(doppler, 0.0);
                 float beaming = beamBase * beamBase * beamBase; // D^3 remaining
                 
                 float3 diskCol = blackbody * filaments * beaming * u.diskBoost;
-                float diskOpacity = saturate(alpha * 0.65);
+                
+                // Reduce opacity for secondary hits to prevent overwashing
+                float opacityMult = (diskCrossings == 0) ? 1.0 : 0.8; 
+                float diskOpacity = saturate(alpha * 0.65 * opacityMult);
                 
                 accum += diskCol * diskOpacity * trans;
                 trans *= (1.0 - diskOpacity);
-                didHitDisk = true;
+                
+                diskCrossings++; // Increment counter
                 hitType = 2;
-                if (trans < 0.02) break;
+                
+                if (trans < 0.01) break; // Early exit optimization
             }
         }
     }
@@ -959,6 +961,7 @@ static float g_currentFPS = 0.0f;
   u->skyIntensity = g_params.skyIntensity;
   u->skyRotation = g_params.skyRotation;
   u->diskBaseTemp = g_params.diskBaseTemp;
+  u->maxDiskCrossings = g_params.maxDiskCrossings;
   u->width = _texWidth;
   u->height = _texHeight;
 
