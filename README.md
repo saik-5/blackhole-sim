@@ -8,15 +8,20 @@ A high-performance, real-time Schwarzschild black hole ray tracer written in pur
 
 ### Core Physics & Rendering
 *   **Real-time Ray Tracing**: Solves the geodesic equations for photons in curved spacetime to render accurate gravitational lensing.
-*   **Physically Based Accretion Disk**: Volumetric rendering with **blackbody radiation** models and relativistic **Doppler color shifting** (redshift/blueshift) for realistic color temperature (2000K - 25000K+).
+*   **Physically Based Accretion Disk**: Volumetric rendering with **blackbody radiation** models and relativistic **Doppler color shifting**.
+*   **Gravitational Redshift**: Accounts for energy loss as photons climb out of the gravity well (`sqrt(1-Rs/r)`), dimming and reddening the inner disk.
 *   **Photon Rings**: Simulates light that orbits the black hole multiple times (up to 8 crossings), creating visible "ghost" rings near the event horizon.
 *   **Gravitational Lensing**: Lenses the actual background sky (Milky Way), creating accurate Einstein rings.
 
 ### Cinematic Post-Processing (New in Phase 2)
 *   **HDR Pipeline**: Full High Dynamic Range rendering pipeline.
-*   **Physically Based Bloom**: Massive, glowing light bleed from the accretion disk using a multi-pass thresholded blur.
-*   **ACES Tonemapping**: Industry-standard filmic color handling to prevent washout and preserve rich colors in bright areas.
-*   **Dynamic Color Grading**: Real-time sliders for **Exposure**, **Contrast**, **Saturation**, and **Bloom Strength**.
+*   **ACES Tonemapping**: Industry-standard filmic color handling to prevent washout.
+*   **Physically Based Bloom**: Massive, glowing light bleed using a multi-pass thresholded blur.
+*   **Lens Effects**:
+    *   **Vignette:** Subtle optical darkening at the edges.
+    *   **Chromatic Aberration:** Physical lens fringing simulation.
+    *   **Film Grain:** Toggleable, animated grain to reduce banding and add texture.
+*   **Dynamic Grading**: Real-time sliders for **Exposure**, **Contrast**, **Saturation**, **Bloom**, and **Grain**.
 
 *   **Zero Dependencies**: Written in pure Objective-C++ and Metal, requiring no external libraries (uses standard macOS frameworks).
 *   **Interactive Camera**: Switch between an orbital view and a free-flight mode to explore the scene.
