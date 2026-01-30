@@ -6,13 +6,21 @@ A high-performance, real-time Schwarzschild black hole ray tracer written in pur
 
 ## Features
 
+### Core Physics & Rendering
 *   **Real-time Ray Tracing**: Solves the geodesic equations for photons in curved spacetime to render accurate gravitational lensing.
-*   **Physically Based Accretion Disk**: Volumetric rendering with **blackbody radiation** models and relativistic **Doppler color shifting** (redshift/blueshift).
+*   **Physically Based Accretion Disk**: Volumetric rendering with **blackbody radiation** models and relativistic **Doppler color shifting** (redshift/blueshift) for realistic color temperature (2000K - 25000K+).
+*   **Photon Rings**: Simulates light that orbits the black hole multiple times (up to 8 crossings), creating visible "ghost" rings near the event horizon.
 *   **Gravitational Lensing**: Lenses the actual background sky (Milky Way), creating accurate Einstein rings.
+
+### Cinematic Post-Processing (New in Phase 2)
+*   **HDR Pipeline**: Full High Dynamic Range rendering pipeline.
+*   **Physically Based Bloom**: Massive, glowing light bleed from the accretion disk using a multi-pass thresholded blur.
+*   **ACES Tonemapping**: Industry-standard filmic color handling to prevent washout and preserve rich colors in bright areas.
+*   **Dynamic Color Grading**: Real-time sliders for **Exposure**, **Contrast**, **Saturation**, and **Bloom Strength**.
+
 *   **Zero Dependencies**: Written in pure Objective-C++ and Metal, requiring no external libraries (uses standard macOS frameworks).
 *   **Interactive Camera**: Switch between an orbital view and a free-flight mode to explore the scene.
 *   **Real-time HUD**: Live debug overlay showing camera coordinates, black hole position, and orbital parameters.
-*   **Dynamic Controls**: Real-time slider to adjust accretion disk temperature (0K - 100,000K).
 *   **Quality Presets**: Adjustable rendering settings (Low to Ultra) to balance performance and visual fidelity.
 
 ## Requirements

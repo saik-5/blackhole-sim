@@ -110,7 +110,7 @@ struct Uniforms {
   float skyIntensity;
   float skyRotation;
   float diskBaseTemp;
-  float _skyPad1;
+  int32_t maxDiskCrossings;
 
   uint32_t width;
   uint32_t height;
@@ -120,6 +120,13 @@ struct Uniforms {
 // ============================================================================
 // Quality Presets
 // ============================================================================
+
+struct DisplayUniforms {
+  float exposure;
+  float contrast;
+  float saturation;
+  float bloomStrength;
+};
 
 enum class QualityPreset { Low, Medium, High, Ultra };
 
@@ -137,7 +144,14 @@ struct SimParams {
 
   float skyIntensity = 1.0f;
   float skyRotation = 0.0f;
-  float diskBaseTemp = 1000.0f;
+  float diskBaseTemp = 8000.0f;
+  int32_t maxDiskCrossings = 1;
+
+  // Display Params (HDR)
+  float exposure = 0.2f;
+  float contrast = 1.0f;
+  float saturation = 2.0f;
+  float bloomStrength = 0.5f; // New default
 
   QualityPreset quality = QualityPreset::High;
 
@@ -148,21 +162,25 @@ struct SimParams {
       maxSteps = 100;
       dPhi = 0.08f;
       escapeR = 2000.0f;
+      maxDiskCrossings = 1;
       break;
     case QualityPreset::Medium:
       maxSteps = 150;
       dPhi = 0.06f;
       escapeR = 3000.0f;
+      maxDiskCrossings = 2;
       break;
     case QualityPreset::High:
       maxSteps = 200;
       dPhi = 0.05f;
       escapeR = 5000.0f;
+      maxDiskCrossings = 3;
       break;
     case QualityPreset::Ultra:
       maxSteps = 300;
       dPhi = 0.04f;
       escapeR = 10000.0f;
+      maxDiskCrossings = 8;
       break;
     }
   }
@@ -359,7 +377,7 @@ struct Uniforms {
     float3 star3Pos; float star3Size; float3 star3Color; float star3Boost;
     float3 star4Pos; float star4Size; float3 star4Color; float star4Boost;
     float3 star5Pos; float star5Size; float3 star5Color; float star5Boost;
-    float skyIntensity; float skyRotation; float diskBaseTemp; float _skyPad1;
+    float skyIntensity; float skyRotation; float diskBaseTemp; int maxDiskCrossings;
     uint width; uint height; uint _pad0; uint _pad1;
 };
 
@@ -510,7 +528,7 @@ kernel void blackHoleCompute(
     
     float3 pPrev = ro, p = ro;
     int hitType = 0;
-    bool didHitDisk = false;
+    int diskCrossings = 0; // REPLACED: bool didHitDisk = false;
     float trans = 1.0;
     float3 accum = float3(0.0);
     
@@ -537,7 +555,8 @@ kernel void blackHoleCompute(
         if (r < u.rs * 1.001) { hitType = 1; break; }
         if (r > u.escapeR) { hitType = 3; break; }
         
-        if (pPrev.y * p.y < 0.0 && !didHitDisk) {
+        // MULTI-HIT LOGIC: Check counter instead of boolean
+        if (pPrev.y * p.y < 0.0 && diskCrossings < u.maxDiskCrossings) {
             float t = pPrev.y / (pPrev.y - p.y);
             float3 phit = mix(pPrev, p, t);
             float rr = length(float2(phit.x, phit.z));
@@ -552,8 +571,6 @@ kernel void blackHoleCompute(
                 float doppler = 1.0 / (gamma * (1.0 - vmag * mu));
                 
                 // 2. Apply Doppler shift to temperature (System 1.5)
-                // The approaching side (doppler > 1) becomes hotter/bluer
-                // The receding side (doppler < 1) becomes cooler/redder
                 float baseTemp = u.diskBaseTemp * pow(u.rin / rr, 0.75);
                 float observedTemp = baseTemp * doppler;
                 float3 blackbody = blackbodyColor(observedTemp);
@@ -578,25 +595,23 @@ kernel void blackHoleCompute(
                 float alphaOuter = 1.0 - smoothstep(u.rout - 4.0, u.rout, rr);
                 float alpha = alphaInner * alphaOuter;
                 
-                // 4. Combine (Beaming is D^3, but we used D^1 for temp, so we need D^4 total?)
-                // Actually, standard relativity says Intensity I_obs = D^4 * I_emit
-                // Our blackbody function returns normalized color (0-1).
-                // We typically separate color (freq shift) and brightness (time dilation + number count).
-                // Let's stick to the spec: "Intensity still scales as D^4... but baked D into temp?"
-                // The spec says: "But we've already baked D into the temperature, so we use D^3 for remaining intensity"
-                // Let's follow that.
-                
+                // 4. Combine
                 float beamBase = max(doppler, 0.0);
                 float beaming = beamBase * beamBase * beamBase; // D^3 remaining
                 
                 float3 diskCol = blackbody * filaments * beaming * u.diskBoost;
-                float diskOpacity = saturate(alpha * 0.65);
+                
+                // Reduce opacity for secondary hits to prevent overwashing
+                float opacityMult = (diskCrossings == 0) ? 1.0 : 0.8; 
+                float diskOpacity = saturate(alpha * 0.65 * opacityMult);
                 
                 accum += diskCol * diskOpacity * trans;
                 trans *= (1.0 - diskOpacity);
-                didHitDisk = true;
+                
+                diskCrossings++; // Increment counter
                 hitType = 2;
-                if (trans < 0.02) break;
+                
+                if (trans < 0.01) break; // Early exit optimization
             }
         }
     }
@@ -652,7 +667,46 @@ kernel void blackHoleCompute(
     output.write(float4(accum, 1.0), gid);
 }
 
-
+kernel void gaussianBlur(
+    texture2d<float, access::sample> inputTexture [[texture(0)]],
+    texture2d<float, access::write> outputTexture [[texture(1)]],
+    constant float2& direction [[buffer(0)]],
+    constant float& threshold [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outputTexture.get_width() || gid.y >= outputTexture.get_height()) return;
+    
+    // FIX: Use normalized coordinates for proper clamp_to_edge behavior on all GPUs
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    // CRITICAL FIX: Use OUTPUT dimensions for UV calculation to handle downsampling correctly!
+    float2 size = float2(outputTexture.get_width(), outputTexture.get_height());
+    float2 uv = (float2(gid) + 0.5) / size;
+    float2 onePixel = 1.0 / size;
+    
+    // 9-tap Gaussian weights (sigma ~ 2.0)
+    // 0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216
+    
+    float4 sum = float4(0.0);
+    
+    auto sample = [&](float2 coords) {
+        float4 c = inputTexture.sample(s, coords);
+        // Bright pass filter: Subtract threshold to remove dark areas from bloom
+        c.rgb = max(float3(0.0), c.rgb - threshold); 
+        return c;
+    };
+    
+    sum += sample(uv) * 0.227027;
+    
+    float2 off1 = direction * 1.38461538 * onePixel;
+    float2 off2 = direction * 3.23076923 * onePixel;
+    
+    sum += sample(uv + off1) * 0.3162162;
+    sum += sample(uv - off1) * 0.3162162;
+    sum += sample(uv + off2) * 0.0702703;
+    sum += sample(uv - off2) * 0.0702703;
+    
+    outputTexture.write(sum, gid);
+}
 
 )";
 
@@ -663,6 +717,29 @@ using namespace metal;
 struct VertexOut { float4 position [[position]]; float2 uv; };
 constant float2 pos[] = { float2(-1,-1), float2(3,-1), float2(-1,3) };
 
+struct DisplayUniforms {
+    float exposure;
+    float contrast;
+    float saturation;
+    float bloomStrength; // New
+};
+
+inline float3 ACESFilm(float3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+inline float3 linearToSRGB(float3 linear) {
+    float3 cutoff = step(linear, float3(0.0031308));
+    float3 higher = 1.055 * pow(linear, 1.0/2.4) - 0.055;
+    float3 lower = linear * 12.92;
+    return mix(higher, lower, cutoff);
+}
+
 vertex VertexOut vertexMain(uint vid [[vertex_id]]) {
     VertexOut out;
     out.position = float4(pos[vid], 0.0, 1.0);
@@ -670,9 +747,37 @@ vertex VertexOut vertexMain(uint vid [[vertex_id]]) {
     return out;
 }
 
-fragment float4 fragmentMain(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
+fragment float4 fragmentMain(VertexOut in [[stage_in]], 
+                             texture2d<float> tex [[texture(0)]],
+                             texture2d<float> bloomTex [[texture(1)]],
+                             constant DisplayUniforms& u [[buffer(0)]]) {
     constexpr sampler s(filter::linear);
-    return tex.sample(s, in.uv);
+    float3 hdr = tex.sample(s, in.uv).rgb;
+    float3 bloom = bloomTex.sample(s, in.uv).rgb;
+    
+    // Add Bloom (before tonemapping)
+    hdr += bloom * u.bloomStrength;
+    
+    // 1. Exposure
+    hdr *= u.exposure;
+    
+    // 2. Contrast (around middle gray)
+    float3 midGray = float3(0.18);
+    hdr = midGray + (hdr - midGray) * u.contrast;
+    hdr = max(hdr, 0.0);
+    
+    // 3. Saturation
+    float luma = dot(hdr, float3(0.2126, 0.7152, 0.0722));
+    hdr = luma + (hdr - luma) * u.saturation;
+    hdr = max(hdr, 0.0);
+    
+    // 4. Tonemap (HDR -> LDR)
+    float3 ldr = ACESFilm(hdr);
+    
+    // 5. Gamma Correction (Linear -> sRGB)
+    float3 srgb = linearToSRGB(ldr);
+    
+    return float4(srgb, 1.0);
 }
 )";
 
@@ -697,15 +802,25 @@ static float g_currentFPS = 0.0f;
 @interface BlackHoleView : MTKView
 @property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property(nonatomic, strong) id<MTLComputePipelineState> computePipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> blurPipeline; // New
 @property(nonatomic, strong) id<MTLRenderPipelineState> displayPipeline;
 @property(nonatomic, strong) id<MTLBuffer> uniformBuffer;
+@property(nonatomic, strong) id<MTLBuffer> displayUniformBuffer;
 @property(nonatomic, strong) id<MTLTexture> renderTexture;
+@property(nonatomic, strong) id<MTLTexture> bloomTextureA; // New: Ping
+@property(nonatomic, strong) id<MTLTexture> bloomTextureB; // New: Pong
 @property(nonatomic) uint32_t texWidth;
 @property(nonatomic) uint32_t texHeight;
 @property(nonatomic, strong) id<MTLTexture> skyTexture;
 @property(nonatomic, strong) NSTextField *debugLabel;
 @property(nonatomic, strong) NSSlider *tempSlider;
 @property(nonatomic, strong) NSTextField *tempValueLabel;
+@property(nonatomic, strong) NSSlider *exposureSlider;
+@property(nonatomic, strong) NSTextField *exposureLabel;
+@property(nonatomic, strong) NSSlider *satSlider;
+@property(nonatomic, strong) NSTextField *satLabel;
+@property(nonatomic, strong) NSSlider *bloomSlider;
+@property(nonatomic, strong) NSTextField *bloomLabel;
 @end
 
 @implementation BlackHoleView
@@ -731,6 +846,10 @@ static float g_currentFPS = 0.0f;
                     [computeLib newFunctionWithName:@"blackHoleCompute"]
                                               error:&error];
 
+    _blurPipeline = [device newComputePipelineStateWithFunction:
+                                [computeLib newFunctionWithName:@"gaussianBlur"]
+                                                          error:&error];
+
     id<MTLLibrary> displayLib = [device newLibraryWithSource:displayShaderSource
                                                      options:nil
                                                        error:&error];
@@ -750,6 +869,10 @@ static float g_currentFPS = 0.0f;
 
     _uniformBuffer = [device newBufferWithLength:sizeof(Uniforms)
                                          options:MTLResourceStorageModeShared];
+
+    _displayUniformBuffer =
+        [device newBufferWithLength:sizeof(DisplayUniforms)
+                            options:MTLResourceStorageModeShared];
 
     g_startTime = std::chrono::high_resolution_clock::now();
     g_lastFrameTime = g_startTime;
@@ -800,6 +923,67 @@ static float g_currentFPS = 0.0f;
   [_tempSlider setTarget:self];
   [_tempSlider setAction:@selector(onTempSliderChanged:)];
   [self addSubview:_tempSlider];
+
+  // 3. Exposure Slider
+  _exposureLabel =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(20, 100, 200, 20)];
+  [_exposureLabel setEditable:NO];
+  [_exposureLabel setSelectable:NO];
+  [_exposureLabel setBezeled:NO];
+  [_exposureLabel setDrawsBackground:NO];
+  [_exposureLabel setTextColor:[NSColor whiteColor]];
+  [_exposureLabel setStringValue:[NSString stringWithFormat:@"Exposure: %.1f",
+                                                            g_params.exposure]];
+  [self addSubview:_exposureLabel];
+
+  _exposureSlider =
+      [[NSSlider alloc] initWithFrame:NSMakeRect(20, 80, 200, 20)];
+  [_exposureSlider setMinValue:0.1];
+  [_exposureSlider setMaxValue:5.0];
+  [_exposureSlider setFloatValue:g_params.exposure];
+  [_exposureSlider setTarget:self];
+  [_exposureSlider setAction:@selector(onExposureChanged:)];
+  [self addSubview:_exposureSlider];
+
+  // 4. Saturation Slider
+  _satLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 150, 200, 20)];
+  [_satLabel setEditable:NO];
+  [_satLabel setSelectable:NO];
+  [_satLabel setBezeled:NO];
+  [_satLabel setDrawsBackground:NO];
+  [_satLabel setTextColor:[NSColor whiteColor]];
+  [_satLabel setStringValue:[NSString stringWithFormat:@"Saturation: %.1f",
+                                                       g_params.saturation]];
+  [self addSubview:_satLabel];
+
+  _satSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 130, 200, 20)];
+  [_satSlider setMinValue:0.0];
+  [_satSlider setMaxValue:2.0];
+  [_satSlider setFloatValue:g_params.saturation];
+  [_satSlider setTarget:self];
+  [_satSlider setAction:@selector(onSatChanged:)];
+  [self addSubview:_satSlider];
+
+  // 5. Bloom Slider
+  _bloomLabel =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(20, 200, 200, 20)];
+  [_bloomLabel setEditable:NO];
+  [_bloomLabel setSelectable:NO];
+  [_bloomLabel setBezeled:NO];
+  [_bloomLabel setDrawsBackground:NO];
+  [_bloomLabel setTextColor:[NSColor whiteColor]];
+  [_bloomLabel
+      setStringValue:[NSString stringWithFormat:@"Bloom: %.1f",
+                                                g_params.bloomStrength]];
+  [self addSubview:_bloomLabel];
+
+  _bloomSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 180, 200, 20)];
+  [_bloomSlider setMinValue:0.0];
+  [_bloomSlider setMaxValue:2.0];
+  [_bloomSlider setFloatValue:g_params.bloomStrength];
+  [_bloomSlider setTarget:self];
+  [_bloomSlider setAction:@selector(onBloomChanged:)];
+  [self addSubview:_bloomSlider];
 }
 
 - (void)onTempSliderChanged:(id)sender {
@@ -807,9 +991,25 @@ static float g_currentFPS = 0.0f;
   g_params.diskBaseTemp = newVal;
   [_tempValueLabel
       setStringValue:[NSString stringWithFormat:@"Temp: %.0f K", newVal]];
+}
 
-  // Ensure view keeps focus for keyboard controls
-  // [self.window makeFirstResponder:self];
+- (void)onExposureChanged:(id)sender {
+  g_params.exposure = [_exposureSlider floatValue];
+  [_exposureLabel setStringValue:[NSString stringWithFormat:@"Exposure: %.1f",
+                                                            g_params.exposure]];
+}
+
+- (void)onSatChanged:(id)sender {
+  g_params.saturation = [_satSlider floatValue];
+  [_satLabel setStringValue:[NSString stringWithFormat:@"Saturation: %.1f",
+                                                       g_params.saturation]];
+}
+
+- (void)onBloomChanged:(id)sender {
+  g_params.bloomStrength = [_bloomSlider floatValue];
+  [_bloomLabel
+      setStringValue:[NSString stringWithFormat:@"Bloom: %.1f",
+                                                g_params.bloomStrength]];
 }
 
 - (void)layout {
@@ -892,8 +1092,36 @@ static float g_currentFPS = 0.0f;
   desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
   desc.storageMode = MTLStorageModePrivate;
   _renderTexture = [self.device newTextureWithDescriptor:desc];
+
+  // Create Bloom Textures (Half Resolution)
+  desc.width = width / 2;
+  desc.height = height / 2;
+  _bloomTextureA = [self.device newTextureWithDescriptor:desc];
+  _bloomTextureB = [self.device newTextureWithDescriptor:desc];
+
   _texWidth = width;
   _texHeight = height;
+}
+
+// Helper to dispatch a blur pass
+- (void)dispatchBlur:(id<MTLCommandBuffer>)cmdBuffer
+                from:(id<MTLTexture>)src
+                  to:(id<MTLTexture>)dst
+                 dir:(simd_float2)direction
+           threshold:(float)thresh {
+  id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+  [enc setComputePipelineState:_blurPipeline];
+  [enc setTexture:src atIndex:0];
+  [enc setTexture:dst atIndex:1];
+  [enc setBytes:&direction length:sizeof(direction) atIndex:0];
+  [enc setBytes:&thresh length:sizeof(thresh) atIndex:1];
+
+  MTLSize tgSize = MTLSizeMake(16, 16, 1);
+  MTLSize tgCount =
+      MTLSizeMake((dst.width + 15) / 16, (dst.height + 15) / 16, 1);
+
+  [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
+  [enc endEncoding];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -959,6 +1187,7 @@ static float g_currentFPS = 0.0f;
   u->skyIntensity = g_params.skyIntensity;
   u->skyRotation = g_params.skyRotation;
   u->diskBaseTemp = g_params.diskBaseTemp;
+  u->maxDiskCrossings = g_params.maxDiskCrossings;
   u->width = _texWidth;
   u->height = _texHeight;
 
@@ -978,12 +1207,54 @@ static float g_currentFPS = 0.0f;
   [computeEncoder dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
   [computeEncoder endEncoding];
 
+  // --- BLOOM PASSES ---
+  // Pass 1: Downsample + Blur Horz (RenderTexture -> BloomA)
+  // WITH THRESHOLD: Cut off background starfield (brightness < 0.8) to fix
+  // washed-out look.
+  [self dispatchBlur:cmdBuffer
+                from:_renderTexture
+                  to:_bloomTextureA
+                 dir:simd_make_float2(1, 0)
+           threshold:0.8f];
+
+  // Pass 2: Blur Vert (BloomA -> BloomB) - No threshold for subsequent passes
+  [self dispatchBlur:cmdBuffer
+                from:_bloomTextureA
+                  to:_bloomTextureB
+                 dir:simd_make_float2(0, 1)
+           threshold:0.0f];
+
+  // Pass 3: Blur Horz (BloomB -> BloomA)
+  [self dispatchBlur:cmdBuffer
+                from:_bloomTextureB
+                  to:_bloomTextureA
+                 dir:simd_make_float2(1, 0)
+           threshold:0.0f];
+
+  // Pass 4: Blur Vert (BloomA -> BloomB) - Final Result in BloomB
+  [self dispatchBlur:cmdBuffer
+                from:_bloomTextureA
+                  to:_bloomTextureB
+                 dir:simd_make_float2(0, 1)
+           threshold:0.0f];
+  // --------------------
+
   MTLRenderPassDescriptor *passDesc = self.currentRenderPassDescriptor;
   if (passDesc) {
+    // Update Display Uniforms
+    DisplayUniforms *du = (DisplayUniforms *)_displayUniformBuffer.contents;
+    du->exposure = g_params.exposure;
+    du->contrast = g_params.contrast;
+    du->saturation = g_params.saturation;
+    du->bloomStrength = g_params.bloomStrength;
+
     id<MTLRenderCommandEncoder> renderEncoder =
         [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
     [renderEncoder setRenderPipelineState:_displayPipeline];
     [renderEncoder setFragmentTexture:_renderTexture atIndex:0];
+    [renderEncoder setFragmentTexture:_bloomTextureB
+                              atIndex:1]; // Bind Final Bloom
+    [renderEncoder setFragmentBuffer:_displayUniformBuffer offset:0 atIndex:0];
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                       vertexStart:0
                       vertexCount:3];
